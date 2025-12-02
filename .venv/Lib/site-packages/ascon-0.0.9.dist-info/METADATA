@@ -1,0 +1,60 @@
+Metadata-Version: 2.1
+Name: ascon
+Version: 0.0.9
+Summary: Lightweight authenticated encryption and hashing
+Home-page: https://ascon.iaik.tugraz.at/
+License: CC0 1.0
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+
+Python implementation of Ascon
+==============================
+
+This is a Python3 implementation of Ascon v1.2, an authenticated cipher and hash function.
+
+https://github.com/meichlseder/pyascon
+
+Ascon
+-----
+
+Ascon is a family of [authenticated encryption](https://en.wikipedia.org/wiki/Authenticated_encryption) (AEAD) and [hashing](https://en.wikipedia.org/wiki/Cryptographic_hash_function) algorithms designed to be lightweight and easy to implement, even with added countermeasures against side-channel attacks.
+It was designed by a team of cryptographers from Graz University of Technology, Infineon Technologies, and Radboud University: Christoph Dobraunig, Maria Eichlseder, Florian Mendel, and Martin Schläffer.
+
+Ascon has been selected as the standard for lightweight cryptography in the [NIST Lightweight Cryptography competition (2019–2023)](https://csrc.nist.gov/projects/lightweight-cryptography) and as the primary choice for lightweight authenticated encryption in the final portfolio of the [CAESAR competition (2014–2019)](https://competitions.cr.yp.to/caesar-submissions.html).
+
+Find more information, including the specification and more implementations here:
+
+https://ascon.iaik.tugraz.at/
+
+
+Algorithms
+----------
+
+This is a simple reference implementation of Ascon v1.2 as submitted to the NIST LWC competition that includes 
+
+  * Authenticated encryption `ascon.encrypt(key, nonce, associateddata, plaintext, variant="Ascon-128")` (and similarly `decrypt`) with the following 3 family members:
+
+    - `Ascon-128`
+    - `Ascon-128a`
+    - `Ascon-80pq`
+  
+  * Hashing algorithms `ascon.hash(message, variant="Ascon-Hash", hashlength=32)` including 4 hash function variants with fixed 256-bit (`Hash`) or variable (`Xof`) output lengths:
+
+    - `Ascon-Hash`
+    - `Ascon-Hasha`
+    - `Ascon-Xof`
+    - `Ascon-Xofa`
+  
+  * Message authentication codes `ascon.mac(key, message, variant="Ascon-Mac", taglength=16)` including 5 MAC variants (from https://eprint.iacr.org/2021/1574, not part of the LWC proposal) with fixed 128-bit (`Mac`) or variable (`Prf`) output lengths, including a variant for short messages of up to 128 bits (`PrfShort`).
+
+    - `Ascon-Mac`
+    - `Ascon-Maca`
+    - `Ascon-Prf`
+    - `Ascon-Prfa`
+    - `Ascon-PrfShort`
+
+

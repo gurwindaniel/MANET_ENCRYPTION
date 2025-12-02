@@ -1,0 +1,13 @@
+# From your project folder
+py -3.12 -m venv .venv
+
+# PowerShell
+.\.venv\Scripts\Activate.ps1
+# (You should see (.venv) prefix in the prompt)
+
+python -m pip install --upgrade pip
+pip install cryptography ascon
+
+python -c "import cryptography, ascon; print('OK:', cryptography.__version__)"
+
+pip install -r requirements.txt
