@@ -12,30 +12,38 @@ from torch_geometric.data import Data
 import math  # Already imported, but needed for log in UCB
 
 class GNNModel(nn.Module):
-    """Very deep GCN-based GNN for neighbor scoring with more layers and minimal dropout."""
+    """Tuned GCN-based GNN for neighbor scoring with residual connections and batch normalization."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.layers = nn.ModuleList([GCNConv(input_dim if i == 0 else hidden_dim, hidden_dim) for i in range(8)])
-        self.out_layer = GCNConv(hidden_dim, 1)
-        self.dropout = nn.Dropout(0.1)
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
+        self.conv4 = GCNConv(hidden_dim, 1)
+        self.dropout = nn.Dropout(0.15)
 
     def forward(self, x, edge_index):
-        for conv in self.layers:
-            x = F.leaky_relu(conv(x, edge_index), negative_slope=0.1)
-            x = self.dropout(x)
-        out = self.out_layer(x, edge_index)
-        return out.squeeze(-1)  # [N] scores
+        x1 = F.leaky_relu(self.bn1(self.conv1(x, edge_index)), negative_slope=0.1)
+        x1 = self.dropout(x1)
+        x2 = F.leaky_relu(self.bn2(self.conv2(x1, edge_index)), negative_slope=0.1)
+        x2 = self.dropout(x2)
+        x3 = F.leaky_relu(self.bn3(self.conv3(x2 + x1, edge_index)), negative_slope=0.1)  # Residual
+        x3 = self.dropout(x3)
+        out = self.conv4(x3 + x2, edge_index)  # Residual
+        return out.squeeze(-1)
 
 class OnlineGNN:
     """Online GNN agent for neighbor discovery and scoring using real GNN."""
-    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=1024, neighbor_radius=700):
+    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=256, neighbor_radius=250):  # Fixed radius
         self.node = node
         self.all_nodes = all_nodes
         self.neighbor_radius = neighbor_radius
         self.neighbors = set()
         self.neighbor_features = {}  # node_id: feature vector
         self.gnn = GNNModel(input_dim, hidden_dim)
-        self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.01)
+        self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.005)  # Lower learning rate for stability
         self.last_edge_index = None
         self.last_x = None
         self.mab_counts = {}   # neighbor_id: count of selections
@@ -127,7 +135,7 @@ class OnlineGNN:
         self.optimizer.step()
 
     def mab_select_forwarder(self, candidates):
-        """Select best forwarder using UCB with very high exploration bonus and reward shaping."""
+        """UCB with moderate exploration and reward shaping."""
         self.total_mab_selections += 1
         ucb_scores = {}
         for nid in candidates:
@@ -137,13 +145,13 @@ class OnlineGNN:
                 ucb_scores[nid] = float('inf')
             else:
                 avg_reward = reward / count
-                # Even higher exploration bonus (factor 32)
-                ucb_scores[nid] = avg_reward + math.sqrt(32 * math.log(self.total_mab_selections + 1) / count)
+                # Moderate exploration bonus (factor 8)
+                ucb_scores[nid] = avg_reward + math.sqrt(8 * math.log(self.total_mab_selections + 1) / count)
         # Select the neighbor with the highest UCB score
         return max(ucb_scores, key=ucb_scores.get)
 
     def mab_update(self, neighbor_id, reward, src_node=None, dst_node=None, forwarder_node=None):
-        # Reward shaping: much higher bonus for progress
+        # Reward shaping: moderate bonus for progress
         shaped_reward = reward
         if src_node is not None and dst_node is not None and forwarder_node is not None:
             src_pos = np.array([src_node.x, src_node.y, src_node.z])
@@ -152,7 +160,7 @@ class OnlineGNN:
             src_dist = np.linalg.norm(src_pos - dst_pos)
             fwd_dist = np.linalg.norm(fwd_pos - dst_pos)
             if fwd_dist < src_dist:
-                shaped_reward += 4.0  # Much higher partial reward for progress
+                shaped_reward += 2.0  # Moderate partial reward for progress
         self.mab_counts[neighbor_id] = self.mab_counts.get(neighbor_id, 0) + 1
         self.mab_rewards[neighbor_id] = self.mab_rewards.get(neighbor_id, 0) + shaped_reward
 
@@ -453,8 +461,8 @@ def plot_node_positions(nodes, step, cmap_name='viridis'):
     plt.show()
 
 if __name__ =="__main__":
-    config = Configuration(num_nodes=120)  # Increased node count for higher density
-    mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=20)  # Lower speed for more stable links
+    config = Configuration(num_nodes=120)
+    mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=20)
     cell_size = 250
     spatial_grid = SpatialGrid(cell_size)
     steps = 5
@@ -502,7 +510,7 @@ if __name__ =="__main__":
             opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0)
             src.forwarding_queue.append(opp_frame)
         for node in config.nodes:
-            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=50)  # Increased max_hops
+            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=30)
         pdr = len(delivered_packets) / packets_per_step
         pdr_list.append(pdr)
         print(f"Step {step}: PDR = {pdr:.2f}")
