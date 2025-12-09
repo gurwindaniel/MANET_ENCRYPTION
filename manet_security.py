@@ -1,6 +1,8 @@
 import random
 import math
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
 
 class OnlineGNN:
     """Simple online GNN for neighbor discovery based on spatial info."""
@@ -218,6 +220,27 @@ class SpatialGrid:
                                 receivers.append(node)
         return receivers
 
+def plot_node_positions(nodes, step, cmap_name='viridis'):
+    xs = [node.x for node in nodes]
+    ys = [node.y for node in nodes]
+    zs = [node.z for node in nodes]
+    node_ids = [node.node_id for node in nodes]
+    cmap = get_cmap(cmap_name)
+    norm = plt.Normalize(min(node_ids), max(node_ids))
+    colors = [cmap(norm(nid)) for nid in node_ids]
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    sc = ax.scatter(xs, ys, zs, c=colors, s=60)
+    for i, (x, y, z) in enumerate(zip(xs, ys, zs)):
+        ax.text(x, y, z, str(node_ids[i]), fontsize=8, color='black')
+    ax.set_title(f"Node Positions at Step {step}")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    plt.show()
+
 if __name__ =="__main__":
     config = Configuration(num_nodes=100)
     mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=40)
@@ -236,6 +259,8 @@ if __name__ =="__main__":
         for node in config.nodes:
             print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
         print("-" * 40)
+        # Plot node positions with color difference and numbering
+        plot_node_positions(config.nodes, step)
 
 
 
