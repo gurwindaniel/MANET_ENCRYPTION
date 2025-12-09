@@ -1,11 +1,15 @@
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import os
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D 
 import random
 import math
+from matplotlib.lines import Line2D
+from mpl_toolkits.mplot3d import Axes3D  # needed for 3D plotting
+
 
 try:
     import ascon
@@ -92,8 +96,8 @@ class Node:
     def create_hello_packet(self):
         """Create a Hello packet using this node's properties."""
         # Simulate energy drain for sending a packet
-        if self.energy > 5.0:  # Only send if enough energy (increased threshold)
-            self.drain_energy(0.01)  # Reduced energy cost for hello
+        if self.energy > 1.0:  # allow nodes with low energy to still participate
+            self.drain_energy(0.005)
         signature = self.node_certificate
         return Hello(
             node_id=self.node_id,
@@ -106,8 +110,8 @@ class Node:
 
     def receive_hello(self, hello):
         # Simulate energy drain for receiving a packet
-        if self.energy > 5.0:  # Only receive if enough energy (increased threshold)
-            self.drain_energy(0.005)  # Reduced energy cost for hello receive
+        if self.energy > 1.0:
+            self.drain_energy(0.0025)
         self.mab_agent.receive_hello(hello)
 
     def drain_energy(self, amount):
@@ -136,7 +140,7 @@ class Node:
 
     def process_opp_queue(self, all_nodes, pdr_stats):
         new_queue = []
-        max_forwards_per_packet = 2  # Limit forwards per packet per node
+        max_forwards_per_packet = 8  # increase replication to improve reachability
         for opp_pkt, neighbor_info in self.opp_queue:
             pkt_id = (opp_pkt.src_id, opp_pkt.seq_num)
             if opp_pkt.dst_id == self.node_id:
@@ -148,6 +152,20 @@ class Node:
                     if opp_pkt.seq_num not in pdr_stats.get('delivered_seq_nums', set()):
                         pdr_stats['delivered'] += 1
                         pdr_stats.setdefault('delivered_seq_nums', set()).add(opp_pkt.seq_num)
+                        # Track delivered bytes and encryption bytes per-packet
+                        payload = opp_pkt.payload
+                        if isinstance(payload, (bytes, bytearray)):
+                            payload_len = len(payload)
+                            pdr_stats['encrypted_bytes_delivered'] = pdr_stats.get('encrypted_bytes_delivered', 0) + payload_len
+                            pdr_stats['current_step_encrypted_bytes'] = pdr_stats.get('current_step_encrypted_bytes', 0) + payload_len
+                        else:
+                            payload_len = len(str(payload).encode())
+                        pdr_stats['delivered_bytes'] = pdr_stats.get('delivered_bytes', 0) + payload_len
+                        pdr_stats['current_step_bandwidth'] = pdr_stats.get('current_step_bandwidth', 0) + payload_len
+                        # record delivery step if available
+                        step = pdr_stats.get('current_step', None)
+                        if step is not None:
+                            pdr_stats.setdefault('packet_delivery_steps', {})[opp_pkt.seq_num] = step
                 continue
             dst_node = next((n for n in all_nodes if n.node_id == opp_pkt.dst_id), None)
             if not dst_node:
@@ -160,7 +178,8 @@ class Node:
                 if nid == self.node_id:
                     continue
                 neighbor = next((n for n in all_nodes if n.node_id == nid), None)
-                if not neighbor or neighbor.energy <= 5.0:  # Only forward to neighbors with enough energy (increased threshold)
+                # allow more nodes with low energy to be eligible
+                if not neighbor or neighbor.energy <= 1.0:
                     continue
                 neighbor_dist = math.sqrt(sum((a-b)**2 for a, b in zip(neighbor.position, dst_pos)))
                 pkt_id = (opp_pkt.src_id, opp_pkt.seq_num)
@@ -170,74 +189,86 @@ class Node:
             valid_neighbors.sort(key=lambda x: x[0].energy, reverse=True)
             # Try strictly closer neighbors first
             closer_neighbors = [n for n, d in valid_neighbors if d < my_dist]
-            forwards = 0
-            if closer_neighbors and self.energy > 5.0 and pkt_id not in self.forwarded_seq_nums:
-                for neighbor in closer_neighbors[:max_forwards_per_packet]:
-                    key = neighbor.get_cooperation_info().get('shared_key', b'1234567890123456')
-                    payload_bytes = opp_pkt.payload.encode() if isinstance(opp_pkt.payload, str) else opp_pkt.payload
-                    encrypted_payload = self.encrypt_payload_bytes(payload_bytes, key)
-                    new_pkt = OPPPacket(self.node_id, opp_pkt.dst_id, encrypted_payload, opp_pkt.seq_num)
-                    neighbor.receive_opp_packet(new_pkt, neighbor.get_cooperation_info())
-                    pdr_stats['forwarded'] += 1
-                    self.drain_energy(0.05)  # Reduced energy cost for forwarding
-                    forwarded = True
-                    forwards += 1
-                    if forwards >= max_forwards_per_packet:
-                        break
-                self.forwarded_seq_nums.add(pkt_id)
-            elif valid_neighbors and self.energy > 5.0 and pkt_id not in self.forwarded_seq_nums:
+            for forwards in range(max_forwards_per_packet):
+                # allow nodes with lower remaining energy to forward
+                if closer_neighbors and self.energy > 1.0 and pkt_id not in self.forwarded_seq_nums:
+                    for neighbor in closer_neighbors[:max_forwards_per_packet]:
+                        # derive per-pair key: fetch key derived between self and neighbor
+                        key = self.mab_agent.get_shared_key(neighbor.node_id) or b'1234567890123456'
+                        payload_bytes = opp_pkt.payload.encode() if isinstance(opp_pkt.payload, str) else opp_pkt.payload
+                        encrypted_payload = self.encrypt_payload_bytes(payload_bytes, key)
+                        new_pkt = OPPPacket(self.node_id, opp_pkt.dst_id, encrypted_payload, opp_pkt.seq_num)
+                        neighbor.receive_opp_packet(new_pkt, neighbor.get_cooperation_info(self.node_id))
+                        pdr_stats['forwarded'] += 1
+                        self.drain_energy(0.03)  # slightly lower cost so more forwards possible
+                        forwarded = True
+                        forwards += 1
+                        if forwards >= max_forwards_per_packet:
+                            break
+                    self.forwarded_seq_nums.add(pkt_id)
                 # If no strictly closer neighbor, forward to the closest valid neighbor(s)
-                for neighbor, _ in valid_neighbors[:max_forwards_per_packet]:
-                    key = neighbor.get_cooperation_info().get('shared_key', b'1234567890123456')
-                    payload_bytes = opp_pkt.payload.encode() if isinstance(opp_pkt.payload, str) else opp_pkt.payload
-                    encrypted_payload = self.encrypt_payload_bytes(payload_bytes, key)
-                    new_pkt = OPPPacket(self.node_id, opp_pkt.dst_id, encrypted_payload, opp_pkt.seq_num)
-                    neighbor.receive_opp_packet(new_pkt, neighbor.get_cooperation_info())
-                    pdr_stats['forwarded'] += 1
-                    self.drain_energy(0.05)  # Reduced energy cost for forwarding
-                    forwarded = True
-                    forwards += 1
-                    if forwards >= max_forwards_per_packet:
-                        break
-                self.forwarded_seq_nums.add(pkt_id)
+                elif valid_neighbors and self.energy > 1.0 and pkt_id not in self.forwarded_seq_nums:
+                    for neighbor, _ in valid_neighbors[:max_forwards_per_packet]:
+                        key = self.mab_agent.get_shared_key(neighbor.node_id) or b'1234567890123456'
+                        payload_bytes = opp_pkt.payload.encode() if isinstance(opp_pkt.payload, str) else opp_pkt.payload
+                        encrypted_payload = self.encrypt_payload_bytes(payload_bytes, key)
+                        new_pkt = OPPPacket(self.node_id, opp_pkt.dst_id, encrypted_payload, opp_pkt.seq_num)
+                        neighbor.receive_opp_packet(new_pkt, neighbor.get_cooperation_info(self.node_id))
+                        pdr_stats['forwarded'] += 1
+                        self.drain_energy(0.03)
+                        forwarded = True
+                        forwards += 1
+                        if forwards >= max_forwards_per_packet:
+                            break
+                    self.forwarded_seq_nums.add(pkt_id)
             if not forwarded:
                 new_queue.append((opp_pkt, neighbor_info))
         self.opp_queue = new_queue
 
     def encrypt_payload(self, payload, key):
         if ascon:
-            nonce = b'0000000000000000'  # 16 bytes for ASCON default variant
-            return ascon.encrypt(key, nonce, payload.encode(), b'')
+            # ensure key is bytes and 16 bytes long
+            key = key if isinstance(key, bytes) else bytes(key, 'utf-8')
+            if len(key) != 16:
+                key = key.ljust(16, b'\0')[:16]
+            nonce = os.urandom(16)  # unique nonce per encryption
+            ct = ascon.encrypt(key, nonce, payload.encode(), b'')
+            # prefix nonce so receiver can decrypt later: nonce || ciphertext
+            return nonce + ct
         else:
             return payload.encode()  # No encryption fallback
 
     def encrypt_payload_bytes(self, payload_bytes, key):
         if ascon:
-            nonce = b'0000000000000000'  # 16 bytes for ASCON default variant
             # ASCON expects key and nonce as bytes of correct length, and payload as bytes.
-            # Ensure key and nonce are bytes and correct length
             key = key if isinstance(key, bytes) else bytes(key, 'utf-8')
             if len(key) != 16:
                 key = key.ljust(16, b'\0')[:16]
-            if len(nonce) != 16:
-                nonce = nonce.ljust(16, b'\0')[:16]
+            nonce = os.urandom(16)
             payload_bytes = payload_bytes if isinstance(payload_bytes, bytes) else bytes(payload_bytes)
             try:
-                return ascon.encrypt(key, nonce, payload_bytes, b'')
-            except Exception as e:
-                # Fallback to unencrypted if ASCON fails
-                return payload_bytes
+                ct = ascon.encrypt(key, nonce, payload_bytes, b'')
+                return nonce + ct
+            except Exception:
+                # Fallback to unencrypted if ASCON fails; still prefix a zero nonce to indicate no-auth encryption
+                return b'\x00'*16 + payload_bytes
         else:
             return payload_bytes  # No encryption fallback
 
-    def get_cooperation_info(self):
-        """Return info for MARL cooperation."""
+    def get_cooperation_info(self, neighbor_id=None):
+        """Return info for MARL cooperation and optionally per-neighbor shared key."""
+        shared_key = None
+        if neighbor_id:
+            shared_key = self.mab_agent.get_shared_key(neighbor_id)
+        # fallback default key (kept for compatibility)
+        if shared_key is None:
+            shared_key = b'1234567890123456'
         return {
             'mobility': self.instantaneous_speed,
             'energy': self.energy,
             'stability': 1.0,  # Placeholder for stability
             'q_top_actions': self.q_agent.top_actions(),
-            'shared_key': b'1234567890123456',  # Example shared key
+            'shared_key': shared_key,  # Example shared key
         }
 
 class Configure:
@@ -250,8 +281,8 @@ class Configure:
         ).decode()
         self.nodes = []
         self._create_nodes()
-        # assign random 3D positions for each node
-        self._assign_random_positions(space_size=100.0)
+        # assign random 3D positions for each node (increase space so long distances exist)
+        self._assign_random_positions(space_size=1000.0)
 
     def _generate_mac(self):
         return "02:00:%02x:%02x:%02x:%02x" % tuple(os.urandom(4))
@@ -342,28 +373,50 @@ class Hello:
         self.speed = speed        # instantaneous speed
 
 class MABAgent:
-    def __init__(self, node, distance_threshold=250.0):
+    def __init__(self, node, distance_threshold=600.0):
         self.node = node
         self.distance_threshold = distance_threshold
-        self.hello_queue = {}  # node_id -> Hello
+        # store per-neighbor: node_id -> {"hello": Hello, "shared_key": bytes}
+        self.hello_queue = {}
 
     def receive_hello(self, hello):
         # Calculate Euclidean distance
         x1, y1, z1 = self.node.position
         x2, y2, z2 = hello.position
         dist = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-        # Decision: keep or remove
-        if dist <= self.distance_threshold:
-            self.hello_queue[hello.node_id] = hello
+        # Try to verify identity and derive shared key; ignore if invalid
+        shared_key = None
+        try:
+            # verify and fetch peer ecc public key (raises on bad cert)
+            peer_pub_pem = Node.verify_received_identity(hello, self.node.root_ca_public_key)
+            # derive per-pair shared key (ECDH + HKDF)
+            shared_key = self.node.derive_shared_key(peer_pub_pem)
+        except Exception:
+            # verification failed -> treat as untrusted (don't store)
+            shared_key = None
+
+        # Decision: keep or remove (only store if verified and within distance)
+        if dist <= self.distance_threshold and shared_key is not None:
+            self.hello_queue[hello.node_id] = {"hello": hello, "shared_key": shared_key}
         else:
+            # remove if present
             self.hello_queue.pop(hello.node_id, None)
+
+    def get_shared_key(self, neighbor_id):
+        entry = self.hello_queue.get(neighbor_id)
+        if entry:
+            return entry.get("shared_key")
+        return None
 
     def neighbors(self):
         return list(self.hello_queue.keys())
 
     def neighbor_info(self):
-        return {nid: {"distance": math.sqrt(sum((a-b)**2 for a, b in zip(self.node.position, self.hello_queue[nid].position))),
-                      "speed": self.hello_queue[nid].speed}
+        return {nid: {
+                    "distance": math.sqrt(sum((a-b)**2 for a, b in zip(self.node.position, self.hello_queue[nid]["hello"].position))),
+                    "speed": self.hello_queue[nid]["hello"].speed,
+                    "shared_key": self.hello_queue[nid].get("shared_key")
+                }
                 for nid in self.hello_queue}
 
 class CooperativeQLAgent:
@@ -490,8 +543,8 @@ def compute_energy_per_packet(nodes, delivered):
 
 def compute_encryption_overhead(pdr_stats):
     """Estimate encryption overhead as ratio of encrypted bytes to total bytes delivered."""
-    encrypted_bytes = pdr_stats.get('encrypted_delivered', 0)
-    total_bytes = sum(pdr_stats['step_bandwidth'])
+    encrypted_bytes = pdr_stats.get('encrypted_bytes_delivered', 0)
+    total_bytes = pdr_stats.get('delivered_bytes', sum(pdr_stats.get('step_bandwidth', [])))
     return encrypted_bytes / max(1, total_bytes)
 
 def compute_forwarding_efficiency(pdr_stats):
@@ -503,111 +556,251 @@ def compute_avg_delay(packet_delivery_steps, delivered_seq_nums):
     delays = [packet_delivery_steps.get(seq, 0) for seq in delivered_seq_nums]
     return sum(delays) / max(1, len(delays))
 
+def plot_src_dst_distances(nodes, packet_map, out_file='node_src_dst_distances.png', show_legend=True):
+    """3D placement: mark packet origin (yellow) and destination (red) and show legend of distances per packet."""
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # node positions
+    xs = [n.position[0] for n in nodes]
+    ys = [n.position[1] for n in nodes]
+    zs = [n.position[2] for n in nodes]
+    ax.scatter(xs, ys, zs, c='lightblue', s=40, depthshade=True, label='nodes')
+
+    node_map = {n.node_id: n for n in nodes}
+
+    # collect legend handles for packet distance labels
+    legend_handles = []
+    legend_labels = []
+
+    for seq, (s_id, d_id) in packet_map.items():
+        s = node_map.get(s_id)
+        d = node_map.get(d_id)
+        if not s or not d:
+            continue
+        sx, sy, sz = s.position
+        dx, dy, dz = d.position
+        # draw line between src and dst
+        ax.plot([sx, dx], [sy, dy], [sz, dz], c='gray', alpha=0.6, linewidth=1)
+        # mark source (yellow) and destination (red)
+        ax.scatter([sx], [sy], [sz], c='yellow', s=120, edgecolors='k', marker='*')
+        ax.scatter([dx], [dy], [dz], c='red', s=90, marker='o', edgecolors='k')
+        # annotate small id near points
+        ax.text(sx, sy, sz, f"{s.node_id}\n(S{seq})", color='black', fontsize=7)
+        ax.text(dx, dy, dz, f"{d.node_id}\n(D{seq})", color='black', fontsize=7)
+        # compute distance
+        dist = math.sqrt((sx-dx)**2 + (sy-dy)**2 + (sz-dz)**2)
+        # prepare legend entry (use Line2D handle)
+        handle = Line2D([0],[0], color='gray', lw=2)
+        legend_handles.append(handle)
+        legend_labels.append(f"pkt {seq}: {dist:.1f} m")
+
+    ax.set_title("Node Placement: Packet origins (yellow) and destinations (red)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+
+    if show_legend and legend_handles:
+        # place legend outside plot to avoid clutter
+        ax.legend(legend_handles, legend_labels, title='Packet distances', loc='upper left', bbox_to_anchor=(1.05, 1))
+        plt.subplots_adjust(right=0.75)
+
+    fig.savefig(out_file, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+def plot_nodes_and_packets_3d(nodes, packet_map, show_labels=True):
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot all nodes
+    xs = [n.position[0] for n in nodes]
+    ys = [n.position[1] for n in nodes]
+    zs = [n.position[2] for n in nodes]
+    ax.scatter(xs, ys, zs, c='skyblue', s=60, depthshade=True, label='Nodes')
+
+    node_dict = {n.node_id: n for n in nodes}
+
+    # Plot packets
+    for seq, (src_id, dst_id) in packet_map.items():
+        src_node = node_dict[src_id]
+        dst_node = node_dict[dst_id]
+
+        sx, sy, sz = src_node.position
+        dx, dy, dz = dst_node.position
+
+        ax.plot([sx, dx], [sy, dy], [sz, dz], c='gray', alpha=0.5, linewidth=1)
+        ax.scatter([sx], [sy], [sz], c='yellow', s=120, marker='*', edgecolors='k')
+        ax.scatter([dx], [dy], [dz], c='red', s=90, marker='o', edgecolors='k')
+
+        if show_labels:
+            ax.text(sx, sy, sz, f"{src_node.node_id}\n(S{seq})", fontsize=8, color='black')
+            ax.text(dx, dy, dz, f"{dst_node.node_id}\n(D{seq})", fontsize=8, color='black')
+
+    ax.set_title("3D MANET Node Placement with Packet Flows")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    plt.show()
+
+def plot_nodes_and_packet_flows(nodes, packet_map, delivered_seq_nums, out_placement='node_placement.png', out_flows='node_placement_flows.png'):
+    """Save two images:
+       - out_placement: plain node placement (PNG)
+       - out_flows: nodes with packet origins (yellow star), destinations (red circle) and lines (green=delivered, red=undelivered)
+    """
+    # Plain placement
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    xs = [n.position[0] for n in nodes]
+    ys = [n.position[1] for n in nodes]
+    zs = [n.position[2] for n in nodes]
+    ax.scatter(xs, ys, zs, c='tab:blue', s=60, depthshade=True)
+    for n in nodes:
+        ax.text(n.position[0], n.position[1], n.position[2], n.node_id, fontsize=8)
+    ax.set_title("Node Placement")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    fig.savefig(out_placement, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    # Flows image
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(xs, ys, zs, c='lightgray', s=40, depthshade=True, label='nodes')
+    node_map = {n.node_id: n for n in nodes}
+    for seq, pair in packet_map.items():
+        try:
+            s_id, d_id = pair
+        except Exception:
+            continue
+        s = node_map.get(s_id)
+        d = node_map.get(d_id)
+        if not s or not d:
+            continue
+        sx, sy, sz = s.position
+        dx, dy, dz = d.position
+        # line colored by delivery status
+        color = 'green' if seq in delivered_seq_nums else 'red'
+        ax.plot([sx, dx], [sy, dy], [sz, dz], c=color, alpha=0.6, linewidth=1)
+        ax.scatter([sx], [sy], [sz], c='yellow', s=120, marker='*', edgecolors='k')
+        ax.scatter([dx], [dy], [dz], c='red', s=90, marker='o', edgecolors='k')
+        # small labels
+        ax.text(sx, sy, sz, f"{s.node_id}\n(S{seq})", fontsize=7, color='black')
+        ax.text(dx, dy, dz, f"{d.node_id}\n(D{seq})", fontsize=7, color='black')
+    ax.set_title("Node Placement and Packet Flows (green=delivered, red=undelivered)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    fig.savefig(out_flows, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     config = Configure(num_nodes=100)
-    mobility = RandomWaypointMobility(config.nodes)
+    # use larger mobility bounds so nodes can be >400m apart
+    mobility = RandomWaypointMobility(config.nodes, bounds=(1000.0, 1000.0, 1000.0))
+    # initialize stats (adjusted keys for bytes)
     pdr_stats = {
         'delivered': 0,
         'forwarded': 0,
         'sent': 0,
         'delivered_seq_nums': set(),
         'delivered_bytes': 0,
-        'encrypted_delivered': 0,
+        'encrypted_bytes_delivered': 0,
         'step_delivered': [],
         'step_bandwidth': [],
         'step_throughput': [],
         'step_energy': [],
         'step_pdr': [],
-        # New: track sent packets per step
         'step_sent': [],
-        # Initialize new metrics to empty lists
         'step_neighbor_stability': [],
         'step_avg_hop_count': [],
         'step_energy_per_packet': [],
         'step_encryption_overhead': [],
         'packet_delivery_steps': {},  # seq_num -> step delivered
+        'packet_map': {},             # seq_num -> (src_node_id, dst_node_id)
     }
+
     # Initial Hello exchange: each node sends hello to all others
     for node in config.nodes:
         hello_pkt = node.create_hello_packet()
         for other in config.nodes:
             if other.node_id != node.node_id:
                 other.receive_hello(hello_pkt)
-    # Simulate OPP packet sending from random source to random destination
-    num_packets = 50
-    # Track packets sent per step
-    packets_per_step = num_packets // 20
-    remaining_packets = num_packets
-    for seq_num in range(num_packets):
-        src = random.choice(config.nodes)
-        dst = random.choice([n for n in config.nodes if n.node_id != src.node_id])
-        opp_pkt = OPPPacket(src.node_id, dst.node_id, f"Payload {seq_num}", seq_num)
-        src.receive_opp_packet(opp_pkt, src.get_cooperation_info())
-        pdr_stats['sent'] += 1
+    # choose a src/dst pair whose Euclidean distance > 400
+    src_node = None
+    dst_node = None
+    found_pair = False
+    for n in config.nodes:
+        # find farthest neighbor from n
+        farthest = max(config.nodes, key=lambda x: math.sqrt(sum((a-b)**2 for a,b in zip(x.position, n.position))))
+        dist = math.sqrt(sum((a-b)**2 for a,b in zip(farthest.position, n.position)))
+        # require at least 450 meters separation
+        if dist >= 450.0 and n.node_id != farthest.node_id:
+            src_node = n
+            dst_node = farthest
+            found_pair = True
+            break
+    # fallback: if not found (very unlikely with current bounds), pick two random nodes and forcibly set positions
+    if not found_pair:
+        src_node = config.nodes[0]
+        dst_node = config.nodes[1]
+        # move destination far from source
+        sx, sy, sz = src_node.position
+        dst_node.position = (sx + 450.0, sy, sz)
 
-    # Mobility steps, Hello exchange, and OPP processing
-    for step in range(20):
+    print(f"Selected src: {src_node.node_id}, dst: {dst_node.node_id}, distance = {math.sqrt(sum((a-b)**2 for a,b in zip(src_node.position, dst_node.position))):.1f} m")
+
+    # Send 1000 packets from chosen source to chosen destination
+    num_packets = 8
+    for seq_num in range(num_packets):
+        opp_pkt = OPPPacket(src_node.node_id, dst_node.node_id, f"Payload {seq_num}", seq_num)
+        src_node.receive_opp_packet(opp_pkt, src_node.get_cooperation_info())
+        pdr_stats['sent'] += 1
+        pdr_stats['packet_map'][seq_num] = (src_node.node_id, dst_node.node_id)
+
+    # run simulation for more steps to allow propagation
+    total_sim_steps = 200
+    for step in range(total_sim_steps):
+        # set current step in stats so process_opp_queue can stamp delivery step
+        pdr_stats['current_step'] = step
+        # zero per-step accumulators
+        pdr_stats['current_step_bandwidth'] = 0
+        pdr_stats['current_step_encrypted_bytes'] = 0
+
         mobility.step()
-        if step % 2 == 0:
-            for node in config.nodes:
-                hello_pkt = node.create_hello_packet()
-                for other in config.nodes:
-                    if other.node_id != node.node_id:
-                        other.receive_hello(hello_pkt)
+        # broadcast hello every step to keep neighbor tables fresh
+        for node in config.nodes:
+            hello_pkt = node.create_hello_packet()
+            for other in config.nodes:
+                if other.node_id != node.node_id:
+                    other.receive_hello(hello_pkt)
+
         delivered_this_step = 0
         sent_this_step = 0
-        bandwidth_this_step = 0
-        encrypted_this_step = 0
-
-        # Send new packets in each step (distribute evenly)
-        if remaining_packets > 0:
-            to_send = min(packets_per_step, remaining_packets)
-            for _ in range(to_send):
-                src = random.choice(config.nodes)
-                dst = random.choice([n for n in config.nodes if n.node_id != src.node_id])
-                seq_num = pdr_stats['sent']
-                opp_pkt = OPPPacket(src.node_id, dst.node_id, f"Payload {seq_num}", seq_num)
-                src.receive_opp_packet(opp_pkt, src.get_cooperation_info())
-                pdr_stats['sent'] += 1
-                sent_this_step += 1
-            remaining_packets -= to_send
 
         # Process OPP queues multiple times per step for better propagation
-        for _ in range(3):
+        for _ in range(6):
             for node in config.nodes:
                 before_delivered = len(pdr_stats['delivered_seq_nums'])
                 node.process_opp_queue(config.nodes, pdr_stats)
                 after_delivered = len(pdr_stats['delivered_seq_nums'])
                 delivered_now = after_delivered - before_delivered
                 delivered_this_step += delivered_now
-                # Track delivery step for delay metric
-                for seq_num in pdr_stats['delivered_seq_nums']:
-                    if seq_num not in pdr_stats['packet_delivery_steps']:
-                        pdr_stats['packet_delivery_steps'][seq_num] = step
-                # Count bytes and encrypted packets delivered
-                for seq_num in pdr_stats['delivered_seq_nums']:
-                    # Find the delivered packet
-                    for n in config.nodes:
-                        if seq_num in n.delivered_packets:
-                            pkt = next((pkt for pkt, _ in n.opp_queue if pkt.seq_num == seq_num), None)
-                            if pkt:
-                                payload = pkt.payload
-                                if isinstance(payload, bytes):
-                                    bandwidth_this_step += len(payload)
-                                    encrypted_this_step += 1
-                                else:
-                                    bandwidth_this_step += len(str(payload).encode())
-        # After OPP processing
-        # Remove per-step PDR calculation
-        # step_pdr = delivered_this_step / max(1, sent_this_step) if sent_this_step > 0 else 0
-        # pdr_stats['step_pdr'].append(step_pdr)
+
+        # after processing, collect per-step metrics from accumulators
+        bandwidth_this_step = pdr_stats.pop('current_step_bandwidth', 0)
+        encrypted_bytes_this_step = pdr_stats.pop('current_step_encrypted_bytes', 0)
+
         pdr_stats['step_sent'].append(sent_this_step)
         avg_energy = sum(node.energy_usage() for node in config.nodes) / len(config.nodes)
         pdr_stats['step_delivered'].append(delivered_this_step)
         pdr_stats['step_bandwidth'].append(bandwidth_this_step)
         pdr_stats['step_throughput'].append(delivered_this_step)  # packets per step
         pdr_stats['step_energy'].append(avg_energy)
-        pdr_stats['encrypted_delivered'] += encrypted_this_step
 
         # Calculate new metrics
         neighbor_stability = compute_neighbor_stability(config.nodes)
@@ -640,8 +833,8 @@ if __name__ == "__main__":
     print(f"Average Bandwidth: {avg_bandwidth:.2f} bytes/step")
     print(f"Average Node Energy: {sum(node.energy_usage() for node in config.nodes)/len(config.nodes):.2f} Joules")
     # Encryption efficiency
-    encryption_eff = pdr_stats['encrypted_delivered'] / max(1, pdr_stats['delivered'])
-    print(f"Encryption Efficiency (Encrypted Delivered/Total Delivered): {encryption_eff:.2f}")
+    encryption_eff = pdr_stats.get('encrypted_bytes_delivered', 0) / max(1, pdr_stats.get('delivered_bytes', 1))
+    print(f"Encryption Efficiency (Encrypted Bytes Delivered / Total Bytes Delivered): {encryption_eff:.2f}")
 
     # Journal-style summary
     print("\n--- MANET Algorithm Journal Metrics ---")
@@ -789,6 +982,18 @@ if __name__ == "__main__":
     plt.ylabel("Encrypted/Total Bytes")
     plt.tight_layout()
     plt.show()
+
+    # After simulation and before metric plots, save placement images
+    plot_nodes_and_packet_flows(config.nodes, pdr_stats.get('packet_map', {}), pdr_stats['delivered_seq_nums'],
+                                out_placement='node_placement.png', out_flows='node_placement_flows.png')
+
+    # New: save source-destination distance plot
+    plot_src_dst_distances(config.nodes, pdr_stats.get('packet_map', {}), out_file='node_src_dst_distances.png')
+
+    # Example small packet_map display
+    packet_map = {0: (src_node.node_id, dst_node.node_id), 1: ("Node_2", "Node_30")}
+    plot_nodes_and_packets_3d(config.nodes, packet_map)
+
 
 
 
