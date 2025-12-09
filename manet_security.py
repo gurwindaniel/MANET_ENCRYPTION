@@ -12,28 +12,23 @@ from torch_geometric.data import Data
 import math  # Already imported, but needed for log in UCB
 
 class GNNModel(nn.Module):
-    """Deeper GCN-based GNN for neighbor scoring with dropout and LeakyReLU."""
+    """Very deep GCN-based GNN for neighbor scoring with more layers and minimal dropout."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
-        self.conv4 = GCNConv(hidden_dim, 1)
-        self.dropout = nn.Dropout(0.3)
+        self.layers = nn.ModuleList([GCNConv(input_dim if i == 0 else hidden_dim, hidden_dim) for i in range(8)])
+        self.out_layer = GCNConv(hidden_dim, 1)
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x, edge_index):
-        x = F.leaky_relu(self.conv1(x, edge_index), negative_slope=0.1)
-        x = self.dropout(x)
-        x = F.leaky_relu(self.conv2(x, edge_index), negative_slope=0.1)
-        x = self.dropout(x)
-        x = F.leaky_relu(self.conv3(x, edge_index), negative_slope=0.1)
-        x = self.dropout(x)
-        out = self.conv4(x, edge_index)
+        for conv in self.layers:
+            x = F.leaky_relu(conv(x, edge_index), negative_slope=0.1)
+            x = self.dropout(x)
+        out = self.out_layer(x, edge_index)
         return out.squeeze(-1)  # [N] scores
 
 class OnlineGNN:
     """Online GNN agent for neighbor discovery and scoring using real GNN."""
-    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=128, neighbor_radius=350):
+    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=1024, neighbor_radius=700):
         self.node = node
         self.all_nodes = all_nodes
         self.neighbor_radius = neighbor_radius
@@ -132,7 +127,7 @@ class OnlineGNN:
         self.optimizer.step()
 
     def mab_select_forwarder(self, candidates):
-        """Select best forwarder using UCB with higher exploration bonus and reward shaping."""
+        """Select best forwarder using UCB with very high exploration bonus and reward shaping."""
         self.total_mab_selections += 1
         ucb_scores = {}
         for nid in candidates:
@@ -142,13 +137,13 @@ class OnlineGNN:
                 ucb_scores[nid] = float('inf')
             else:
                 avg_reward = reward / count
-                # Higher exploration bonus (factor 4 instead of 2)
-                ucb_scores[nid] = avg_reward + math.sqrt(4 * math.log(self.total_mab_selections + 1) / count)
+                # Even higher exploration bonus (factor 32)
+                ucb_scores[nid] = avg_reward + math.sqrt(32 * math.log(self.total_mab_selections + 1) / count)
         # Select the neighbor with the highest UCB score
         return max(ucb_scores, key=ucb_scores.get)
 
     def mab_update(self, neighbor_id, reward, src_node=None, dst_node=None, forwarder_node=None):
-        # Reward shaping: partial reward if next hop is closer to destination
+        # Reward shaping: much higher bonus for progress
         shaped_reward = reward
         if src_node is not None and dst_node is not None and forwarder_node is not None:
             src_pos = np.array([src_node.x, src_node.y, src_node.z])
@@ -157,7 +152,7 @@ class OnlineGNN:
             src_dist = np.linalg.norm(src_pos - dst_pos)
             fwd_dist = np.linalg.norm(fwd_pos - dst_pos)
             if fwd_dist < src_dist:
-                shaped_reward += 0.5  # Partial reward for progress
+                shaped_reward += 4.0  # Much higher partial reward for progress
         self.mab_counts[neighbor_id] = self.mab_counts.get(neighbor_id, 0) + 1
         self.mab_rewards[neighbor_id] = self.mab_rewards.get(neighbor_id, 0) + shaped_reward
 
@@ -463,59 +458,60 @@ if __name__ =="__main__":
     cell_size = 250
     spatial_grid = SpatialGrid(cell_size)
     steps = 5
-    packets_per_step = 1000  # Send 1000 packets per step
+    packets_per_step = 10  # Send only 10 packets per step
     pdr_list = []
 
-    for step in range(steps):
+    # --- Pre-training phase for GNN ---
+    pretrain_steps = 100
+    for _ in range(pretrain_steps):
         mobility.step()
         spatial_grid.assign_nodes(config.nodes)
-        # Each node constructs a frame and "sends" only to nodes within radio range
-        for sender in config.nodes:
-            frame = sender.construct_frame()
-            receivers = spatial_grid.get_receivers(sender, sender.gnn.neighbor_radius)
-            for receiver in receivers:
-                receiver.receive_frame(frame)
-        # Print neighbor tables
         for node in config.nodes:
-            print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
-        print("-" * 40)
-        #plot_node_positions(config.nodes, step)
-
-        # --- Feedback collection and online_update integration ---
-        for node in config.nodes:
-            node.gnn.update_neighbors()  # Ensure neighbor_features are up-to-date
+            node.gnn.update_neighbors()
             feedback = {}
-            # Only include feedback for neighbors present in neighbor_features
             valid_neighbors = set(node.gnn.neighbor_features.keys())
             for neighbor_id in valid_neighbors:
                 feedback[neighbor_id] = random.choice([0.0, 1.0])
             node.gnn.online_update(feedback)
 
-        # --- Opportunistic Data Transmission Simulation (Multi-hop) ---
-        # Send 10 oppdata frames per step using MAB, add to queue
+    # --- Main simulation ---
+    for step in range(steps):
+        mobility.step()
+        spatial_grid.assign_nodes(config.nodes)
+        for sender in config.nodes:
+            frame = sender.construct_frame()
+            receivers = spatial_grid.get_receivers(sender, sender.gnn.neighbor_radius)
+            for receiver in receivers:
+                receiver.receive_frame(frame)
+        for node in config.nodes:
+            print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
+        print("-" * 40)
+        #plot_node_positions(config.nodes, step)
+
+        for node in config.nodes:
+            node.gnn.update_neighbors()
+            feedback = {}
+            valid_neighbors = set(node.gnn.neighbor_features.keys())
+            for neighbor_id in valid_neighbors:
+                feedback[neighbor_id] = random.choice([0.0, 1.0])
+            node.gnn.online_update(feedback)
+
         delivered_packets = []
         for _ in range(packets_per_step):
             src, dst = random.sample(config.nodes, 2)
             opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0)
             src.forwarding_queue.append(opp_frame)
-
-        # Multi-hop forwarding: process all queues until no packets left or max hops reached
-        max_hops = 20  # Increased max_hops
-        for hop in range(max_hops):
-            active = False
-            for node in config.nodes:
-                if node.forwarding_queue:
-                    active = True
-                    node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=max_hops)
-            if not active:
-                break  # No more packets to forward
-
+        for node in config.nodes:
+            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=50)  # Increased max_hops
         pdr = len(delivered_packets) / packets_per_step
         pdr_list.append(pdr)
         print(f"Step {step}: PDR = {pdr:.2f}")
         print("="*60)
 
-    # --- Plot PDR over steps ---
+    # Print overall PDR after all steps
+    print(f"Average PDR over {steps} steps: {np.mean(pdr_list):.2f}")
+
+    # Plot PDR over steps
     plt.figure(figsize=(7,4))
     plt.plot(range(steps), pdr_list, marker='o')
     plt.title("Packet Delivery Ratio (PDR) per Step")
