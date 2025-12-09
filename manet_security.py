@@ -3,17 +3,36 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GNNModel(nn.Module):
+    """Simple 2-layer MLP as a placeholder for GNN."""
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)  # Output: score for neighbor
+
+    def forward(self, features):
+        x = F.relu(self.fc1(features))
+        out = self.fc2(x)
+        return out.squeeze(-1)  # [N] scores
 
 class OnlineGNN:
-    """Simple online GNN for neighbor discovery based on spatial info."""
-    def __init__(self, node, all_nodes, neighbor_radius=250):
+    """Online GNN agent for neighbor discovery and scoring."""
+    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=16, neighbor_radius=250):
         self.node = node
         self.all_nodes = all_nodes
         self.neighbor_radius = neighbor_radius
         self.neighbors = set()
+        self.neighbor_features = {}  # node_id: feature vector
+        self.gnn = GNNModel(input_dim, hidden_dim)
+        self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.01)
 
     def update_neighbors(self):
         self.neighbors.clear()
+        self.neighbor_features.clear()
         node_pos = np.array([self.node.x, self.node.y, self.node.z])
         for other in self.all_nodes:
             if other.node_id == self.node.node_id:
@@ -22,9 +41,44 @@ class OnlineGNN:
             dist = np.linalg.norm(node_pos - other_pos)
             if dist <= self.neighbor_radius:
                 self.neighbors.add(other.node_id)
+                # Example features: [x, y, z, energy, distance]
+                feat = np.array([
+                    other.x, other.y, other.z,
+                    getattr(other, 'enery', 100.0),
+                    dist
+                ], dtype=np.float32)
+                self.neighbor_features[other.node_id] = feat
 
     def get_neighbors(self):
         return self.neighbors
+
+    def compute_embeddings(self):
+        """Compute scores for each neighbor using GNN."""
+        if not self.neighbor_features:
+            return {}
+        feats = torch.tensor(list(self.neighbor_features.values()))
+        scores = self.gnn(feats).detach().numpy()
+        return {nid: score for nid, score in zip(self.neighbor_features.keys(), scores)}
+
+    def predict_best_forwarder(self):
+        """Return neighbor with highest score."""
+        embeddings = self.compute_embeddings()
+        if not embeddings:
+            return None
+        best_nid = max(embeddings, key=lambda k: embeddings[k])
+        return best_nid, embeddings[best_nid]
+
+    def online_update(self, target_scores):
+        """Dummy online update: train to fit target scores (for demonstration)."""
+        if not self.neighbor_features or not target_scores:
+            return
+        feats = torch.tensor(list(self.neighbor_features.values()))
+        targets = torch.tensor([target_scores[nid] for nid in self.neighbor_features.keys()], dtype=torch.float32)
+        pred = self.gnn(feats)
+        loss = F.mse_loss(pred, targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
 class Node:
     def __init__(self, node_id, address, mac_address):
