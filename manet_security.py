@@ -9,22 +9,27 @@ import torch.nn.functional as F
 # Add PyTorch Geometric imports
 from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data
+import math  # Already imported, but needed for log in UCB
 
 class GNNModel(nn.Module):
-    """GCN-based GNN for neighbor scoring."""
+    """Deeper GCN-based GNN for neighbor scoring."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, 1)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        self.conv4 = GCNConv(hidden_dim, 1)
 
     def forward(self, x, edge_index):
         x = F.relu(self.conv1(x, edge_index))
-        out = self.conv2(x, edge_index)
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        out = self.conv4(x, edge_index)
         return out.squeeze(-1)  # [N] scores
 
 class OnlineGNN:
     """Online GNN agent for neighbor discovery and scoring using real GNN."""
-    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=16, neighbor_radius=250):
+    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=64, neighbor_radius=350):
         self.node = node
         self.all_nodes = all_nodes
         self.neighbor_radius = neighbor_radius
@@ -36,7 +41,7 @@ class OnlineGNN:
         self.last_x = None
         self.mab_counts = {}   # neighbor_id: count of selections
         self.mab_rewards = {}  # neighbor_id: total reward
-        self.epsilon = 0.1     # exploration rate for epsilon-greedy
+        self.total_mab_selections = 0  # For UCB
 
     def update_neighbors(self):
         self.neighbors.clear()
@@ -89,7 +94,7 @@ class OnlineGNN:
         self.last_edge_index = edge_index
         with torch.no_grad():
             scores = self.gnn(x, edge_index)
-        # Return scores for neighbors only (not self)
+        # Optionally: fallback to random scores if no GNN output
         return {nid: float(scores[id_to_idx[nid]]) for nid in self.neighbor_features}
 
     def predict_best_forwarder(self):
@@ -123,14 +128,21 @@ class OnlineGNN:
         self.optimizer.step()
 
     def mab_select_forwarder(self, candidates):
-        """Select best forwarder using epsilon-greedy MAB among candidates."""
-        unexplored = [nid for nid in candidates if self.mab_counts.get(nid, 0) == 0]
-        if unexplored:
-            return random.choice(unexplored)
-        if random.random() < self.epsilon:
-            return random.choice(list(candidates))
-        avg_rewards = {nid: self.mab_rewards.get(nid, 0) / self.mab_counts.get(nid, 1) for nid in candidates}
-        return max(avg_rewards, key=avg_rewards.get)
+        """Select best forwarder using UCB (Upper Confidence Bound)."""
+        self.total_mab_selections += 1
+        ucb_scores = {}
+        for nid in candidates:
+            count = self.mab_counts.get(nid, 0)
+            reward = self.mab_rewards.get(nid, 0)
+            if count == 0:
+                # Encourage exploration
+                ucb_scores[nid] = float('inf')
+            else:
+                avg_reward = reward / count
+                # UCB1 formula
+                ucb_scores[nid] = avg_reward + math.sqrt(2 * math.log(self.total_mab_selections + 1) / count)
+        # Select the neighbor with the highest UCB score
+        return max(ucb_scores, key=ucb_scores.get)
 
     def mab_update(self, neighbor_id, reward):
         self.mab_counts[neighbor_id] = self.mab_counts.get(neighbor_id, 0) + 1
@@ -216,7 +228,7 @@ class Node:
             return True
         return False
 
-    def forward_oppdata(self, config_nodes, spatial_grid, delivered_packets, max_hops=10):
+    def forward_oppdata(self, config_nodes, spatial_grid, delivered_packets, max_hops=20):  # Increased max_hops
         """Process the forwarding queue for multi-hop delivery."""
         new_queue = []
         for frame in self.forwarding_queue:
@@ -231,9 +243,8 @@ class Node:
             self.gnn.update_neighbors()
             neighbor_scores = self.gnn.compute_embeddings()
             if neighbor_scores:
-                top_k = 3
-                sorted_neighbors = sorted(neighbor_scores, key=neighbor_scores.get, reverse=True)
-                candidates = sorted_neighbors[:min(top_k, len(sorted_neighbors))]
+                # Use all available neighbors as candidates
+                candidates = list(neighbor_scores.keys())
                 best_forwarder_id = self.gnn.mab_select_forwarder(candidates)
                 if best_forwarder_id in self.gnn.neighbors:
                     forwarder = next((n for n in config_nodes if n.node_id == best_forwarder_id), None)
@@ -433,12 +444,12 @@ def plot_node_positions(nodes, step, cmap_name='viridis'):
     plt.show()
 
 if __name__ =="__main__":
-    config = Configuration(num_nodes=50)
-    mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=40)
+    config = Configuration(num_nodes=120)  # Increased node count for higher density
+    mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=20)  # Lower speed for more stable links
     cell_size = 250
     spatial_grid = SpatialGrid(cell_size)
     steps = 5
-    packets_per_step = 10
+    packets_per_step = 1000  # Send 1000 packets per step
     pdr_list = []
 
     for step in range(steps):
@@ -454,7 +465,7 @@ if __name__ =="__main__":
         for node in config.nodes:
             print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
         print("-" * 40)
-        plot_node_positions(config.nodes, step)
+        #plot_node_positions(config.nodes, step)
 
         # --- Feedback collection and online_update integration ---
         for node in config.nodes:
@@ -475,7 +486,7 @@ if __name__ =="__main__":
             src.forwarding_queue.append(opp_frame)
 
         # Multi-hop forwarding: process all queues until no packets left or max hops reached
-        max_hops = 10
+        max_hops = 20  # Increased max_hops
         for hop in range(max_hops):
             active = False
             for node in config.nodes:
