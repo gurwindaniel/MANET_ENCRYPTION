@@ -12,24 +12,28 @@ from torch_geometric.data import Data
 import math  # Already imported, but needed for log in UCB
 
 class GNNModel(nn.Module):
-    """Deeper GCN-based GNN for neighbor scoring."""
+    """Deeper GCN-based GNN for neighbor scoring with dropout and LeakyReLU."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.conv3 = GCNConv(hidden_dim, hidden_dim)
         self.conv4 = GCNConv(hidden_dim, 1)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
-        x = F.relu(self.conv3(x, edge_index))
+        x = F.leaky_relu(self.conv1(x, edge_index), negative_slope=0.1)
+        x = self.dropout(x)
+        x = F.leaky_relu(self.conv2(x, edge_index), negative_slope=0.1)
+        x = self.dropout(x)
+        x = F.leaky_relu(self.conv3(x, edge_index), negative_slope=0.1)
+        x = self.dropout(x)
         out = self.conv4(x, edge_index)
         return out.squeeze(-1)  # [N] scores
 
 class OnlineGNN:
     """Online GNN agent for neighbor discovery and scoring using real GNN."""
-    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=64, neighbor_radius=350):
+    def __init__(self, node, all_nodes, input_dim=5, hidden_dim=128, neighbor_radius=350):
         self.node = node
         self.all_nodes = all_nodes
         self.neighbor_radius = neighbor_radius
@@ -128,25 +132,34 @@ class OnlineGNN:
         self.optimizer.step()
 
     def mab_select_forwarder(self, candidates):
-        """Select best forwarder using UCB (Upper Confidence Bound)."""
+        """Select best forwarder using UCB with higher exploration bonus and reward shaping."""
         self.total_mab_selections += 1
         ucb_scores = {}
         for nid in candidates:
             count = self.mab_counts.get(nid, 0)
             reward = self.mab_rewards.get(nid, 0)
             if count == 0:
-                # Encourage exploration
                 ucb_scores[nid] = float('inf')
             else:
                 avg_reward = reward / count
-                # UCB1 formula
-                ucb_scores[nid] = avg_reward + math.sqrt(2 * math.log(self.total_mab_selections + 1) / count)
+                # Higher exploration bonus (factor 4 instead of 2)
+                ucb_scores[nid] = avg_reward + math.sqrt(4 * math.log(self.total_mab_selections + 1) / count)
         # Select the neighbor with the highest UCB score
         return max(ucb_scores, key=ucb_scores.get)
 
-    def mab_update(self, neighbor_id, reward):
+    def mab_update(self, neighbor_id, reward, src_node=None, dst_node=None, forwarder_node=None):
+        # Reward shaping: partial reward if next hop is closer to destination
+        shaped_reward = reward
+        if src_node is not None and dst_node is not None and forwarder_node is not None:
+            src_pos = np.array([src_node.x, src_node.y, src_node.z])
+            dst_pos = np.array([dst_node.x, dst_node.y, dst_node.z])
+            fwd_pos = np.array([forwarder_node.x, forwarder_node.y, forwarder_node.z])
+            src_dist = np.linalg.norm(src_pos - dst_pos)
+            fwd_dist = np.linalg.norm(fwd_pos - dst_pos)
+            if fwd_dist < src_dist:
+                shaped_reward += 0.5  # Partial reward for progress
         self.mab_counts[neighbor_id] = self.mab_counts.get(neighbor_id, 0) + 1
-        self.mab_rewards[neighbor_id] = self.mab_rewards.get(neighbor_id, 0) + reward
+        self.mab_rewards[neighbor_id] = self.mab_rewards.get(neighbor_id, 0) + shaped_reward
 
 class Node:
     def __init__(self, node_id, address, mac_address):
@@ -228,7 +241,7 @@ class Node:
             return True
         return False
 
-    def forward_oppdata(self, config_nodes, spatial_grid, delivered_packets, max_hops=20):  # Increased max_hops
+    def forward_oppdata(self, config_nodes, spatial_grid, delivered_packets, max_hops=20):
         """Process the forwarding queue for multi-hop delivery."""
         new_queue = []
         for frame in self.forwarding_queue:
@@ -254,7 +267,8 @@ class Node:
                         new_frame["payload"] = oppdata  # Preserve original data
                         forwarder.forwarding_queue.append(new_frame)
                         reward = 1.0 if forwarder.node_id == oppdata.dst_id else 0.0
-                        self.gnn.mab_update(best_forwarder_id, reward)
+                        # Pass src, dst, forwarder for reward shaping
+                        self.gnn.mab_update(best_forwarder_id, reward, src_node=self, dst_node=next((n for n in config_nodes if n.node_id == oppdata.dst_id), None), forwarder_node=forwarder)
                         # Optionally print forwarding
                         print(f"Node {self.node_id} forwarded OppData to {oppdata.dst_id} via {best_forwarder_id} (hops={hops+1})")
                 else:
