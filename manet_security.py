@@ -6,21 +6,24 @@ from matplotlib.cm import get_cmap
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Add PyTorch Geometric imports
+from torch_geometric.nn import GCNConv
+from torch_geometric.data import Data
 
 class GNNModel(nn.Module):
-    """Simple 2-layer MLP as a placeholder for GNN."""
+    """GCN-based GNN for neighbor scoring."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)  # Output: score for neighbor
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, 1)
 
-    def forward(self, features):
-        x = F.relu(self.fc1(features))
-        out = self.fc2(x)
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        out = self.conv2(x, edge_index)
         return out.squeeze(-1)  # [N] scores
 
 class OnlineGNN:
-    """Online GNN agent for neighbor discovery and scoring."""
+    """Online GNN agent for neighbor discovery and scoring using real GNN."""
     def __init__(self, node, all_nodes, input_dim=5, hidden_dim=16, neighbor_radius=250):
         self.node = node
         self.all_nodes = all_nodes
@@ -29,6 +32,8 @@ class OnlineGNN:
         self.neighbor_features = {}  # node_id: feature vector
         self.gnn = GNNModel(input_dim, hidden_dim)
         self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.01)
+        self.last_edge_index = None
+        self.last_x = None
 
     def update_neighbors(self):
         self.neighbors.clear()
@@ -41,10 +46,9 @@ class OnlineGNN:
             dist = np.linalg.norm(node_pos - other_pos)
             if dist <= self.neighbor_radius:
                 self.neighbors.add(other.node_id)
-                # Example features: [x, y, z, energy, distance]
                 feat = np.array([
                     other.x, other.y, other.z,
-                    getattr(other, 'enery', 100.0),
+                    getattr(other, 'energy', 100.0),
                     dist
                 ], dtype=np.float32)
                 self.neighbor_features[other.node_id] = feat
@@ -52,29 +56,63 @@ class OnlineGNN:
     def get_neighbors(self):
         return self.neighbors
 
+    def _build_graph(self):
+        """Builds a local graph for message passing."""
+        # Node 0: self, Node 1...N: neighbors
+        node_ids = [self.node.node_id] + list(self.neighbor_features.keys())
+        id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
+        x = [np.array([self.node.x, self.node.y, self.node.z, getattr(self.node, 'energy', 100.0), 0.0], dtype=np.float32)]
+        x += [self.neighbor_features[nid] for nid in self.neighbor_features]
+        x = torch.tensor(x, dtype=torch.float32)
+        # Fully connect self to neighbors (undirected)
+        edge_index = []
+        for nid in self.neighbor_features:
+            i = 0  # self
+            j = id_to_idx[nid]
+            edge_index.append([i, j])
+            edge_index.append([j, i])
+        if not edge_index:
+            edge_index = torch.empty((2,0), dtype=torch.long)
+        else:
+            edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        return x, edge_index, id_to_idx
+
     def compute_embeddings(self):
-        """Compute scores for each neighbor using GNN."""
+        """Compute scores for each neighbor using GNN with message passing."""
         if not self.neighbor_features:
             return {}
-        feats = torch.tensor(list(self.neighbor_features.values()))
-        scores = self.gnn(feats).detach().numpy()
-        return {nid: score for nid, score in zip(self.neighbor_features.keys(), scores)}
+        x, edge_index, id_to_idx = self._build_graph()
+        self.last_x = x
+        self.last_edge_index = edge_index
+        with torch.no_grad():
+            scores = self.gnn(x, edge_index)
+        # Return scores for neighbors only (not self)
+        return {nid: float(scores[id_to_idx[nid]]) for nid in self.neighbor_features}
 
     def predict_best_forwarder(self):
-        """Return neighbor with highest score."""
         embeddings = self.compute_embeddings()
         if not embeddings:
             return None
         best_nid = max(embeddings, key=lambda k: embeddings[k])
         return best_nid, embeddings[best_nid]
 
-    def online_update(self, target_scores):
-        """Dummy online update: train to fit target scores (for demonstration)."""
-        if not self.neighbor_features or not target_scores:
+    def online_update(self, feedback):
+        """
+        Online update using real feedback.
+        feedback: dict {neighbor_id: reward/score}, e.g., 1 for successful delivery, 0 for fail.
+        """
+        if not self.neighbor_features or not feedback:
             return
-        feats = torch.tensor(list(self.neighbor_features.values()))
-        targets = torch.tensor([target_scores[nid] for nid in self.neighbor_features.keys()], dtype=torch.float32)
-        pred = self.gnn(feats)
+        if self.last_x is None or self.last_edge_index is None:
+            return
+        x = self.last_x
+        edge_index = self.last_edge_index
+        id_to_idx = {nid: i for i, nid in enumerate([self.node.node_id] + list(self.neighbor_features.keys()))}
+        targets = torch.zeros(x.size(0))
+        for nid, val in feedback.items():
+            if nid in id_to_idx:
+                targets[id_to_idx[nid]] = val
+        pred = self.gnn(x, edge_index)
         loss = F.mse_loss(pred, targets)
         self.optimizer.zero_grad()
         loss.backward()
@@ -88,7 +126,7 @@ class Node:
         self.x = 0
         self.y = 0
         self.z = 0
-        self.enery = 100.0  # Initial enery in Joules
+        self.energy = 100.0  # Initial energy in Joules
         self.gnn = None  # Will be set after all nodes are created
 
     def __repr__(self):
@@ -315,6 +353,16 @@ if __name__ =="__main__":
         print("-" * 40)
         # Plot node positions with color difference and numbering
         plot_node_positions(config.nodes, step)
+
+        # --- Feedback collection and online_update integration ---
+        # Simulate feedback: for each node, assign random feedback to its neighbors
+        for node in config.nodes:
+            node.gnn.update_neighbors()  # Ensure neighbor_features are up-to-date
+            feedback = {}
+            for neighbor_id in node.gnn.neighbors:
+                # Simulate feedback: 1 for "success", 0 for "fail" (random for demo)
+                feedback[neighbor_id] = random.choice([0.0, 1.0])
+            node.gnn.online_update(feedback)
 
 
 
