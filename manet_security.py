@@ -34,6 +34,9 @@ class OnlineGNN:
         self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.01)
         self.last_edge_index = None
         self.last_x = None
+        self.mab_counts = {}   # neighbor_id: count of selections
+        self.mab_rewards = {}  # neighbor_id: total reward
+        self.epsilon = 0.1     # exploration rate for epsilon-greedy
 
     def update_neighbors(self):
         self.neighbors.clear()
@@ -110,13 +113,28 @@ class OnlineGNN:
         id_to_idx = {nid: i for i, nid in enumerate([self.node.node_id] + list(self.neighbor_features.keys()))}
         targets = torch.zeros(x.size(0))
         for nid, val in feedback.items():
-            if nid in id_to_idx:
-                targets[id_to_idx[nid]] = val
+            idx = id_to_idx.get(nid, None)
+            if idx is not None and idx < len(targets):
+                targets[idx] = val
         pred = self.gnn(x, edge_index)
         loss = F.mse_loss(pred, targets)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+    def mab_select_forwarder(self, candidates):
+        """Select best forwarder using epsilon-greedy MAB among candidates."""
+        unexplored = [nid for nid in candidates if self.mab_counts.get(nid, 0) == 0]
+        if unexplored:
+            return random.choice(unexplored)
+        if random.random() < self.epsilon:
+            return random.choice(list(candidates))
+        avg_rewards = {nid: self.mab_rewards.get(nid, 0) / self.mab_counts.get(nid, 1) for nid in candidates}
+        return max(avg_rewards, key=avg_rewards.get)
+
+    def mab_update(self, neighbor_id, reward):
+        self.mab_counts[neighbor_id] = self.mab_counts.get(neighbor_id, 0) + 1
+        self.mab_rewards[neighbor_id] = self.mab_rewards.get(neighbor_id, 0) + reward
 
 class Node:
     def __init__(self, node_id, address, mac_address):
@@ -128,6 +146,7 @@ class Node:
         self.z = 0
         self.energy = 100.0  # Initial energy in Joules
         self.gnn = None  # Will be set after all nodes are created
+        self.forwarding_queue = []  # Queue for multi-hop forwarding
 
     def __repr__(self):
         return f"Node({self.node_id})"
@@ -164,6 +183,76 @@ class Node:
         dist = np.linalg.norm(node_pos - hello_pos)
         if dist <= 250 and hello.node_id != self.node_id:
             self.gnn.neighbors.add(hello.node_id)
+
+    def construct_oppdata_frame(self, dst_id, hops=0):
+        # Build an opportunistic data frame to send to dst_id
+        oppdata = OppData(self.node_id, dst_id)
+        # For simplicity, reuse headers as in construct_frame
+        multicast_addr = "224.1.1.1"
+        broadcast_mac = "ff:ff:ff:ff:ff:ff"
+        src_port = random.randint(1025, 65535)
+        dst_port = 1024  # Different port for oppdata
+        udp_payload = str(oppdata).encode()
+        udp_length = 8 + len(udp_payload)
+        udp_header = UDPHeader(src_port, dst_port, length=udp_length)
+        ipv4_total_length = 20 + udp_length
+        ipv4_header = IPv4Header(self.address, multicast_addr)
+        ipv4_header.total_length = ipv4_total_length
+        datalink = DataLink80211(self.mac, broadcast_mac)
+        return {
+            "datalink": datalink,
+            "ipv4": ipv4_header,
+            "udp": udp_header,
+            "payload": oppdata,
+            "hops": hops  # Track hop count
+        }
+
+    def receive_oppdata_frame(self, frame):
+        oppdata = frame["payload"]
+        # If this node is the destination, "receive" the data
+        if oppdata.dst_id == self.node_id:
+            # For demo, just print receipt
+            print(f"Node {self.node_id} received OppData from {oppdata.src_id}: {oppdata.data:.3f} (hops={frame.get('hops', 0)})")
+            return True
+        return False
+
+    def forward_oppdata(self, config_nodes, spatial_grid, delivered_packets, max_hops=10):
+        """Process the forwarding queue for multi-hop delivery."""
+        new_queue = []
+        for frame in self.forwarding_queue:
+            oppdata = frame["payload"]
+            hops = frame.get("hops", 0)
+            if hops >= max_hops:
+                continue  # Drop if exceeded max hops
+            if self.receive_oppdata_frame(frame):
+                delivered_packets.append((oppdata.src_id, oppdata.dst_id))
+                continue  # Delivered
+            # Not delivered, forward to next best neighbor
+            self.gnn.update_neighbors()
+            neighbor_scores = self.gnn.compute_embeddings()
+            if neighbor_scores:
+                top_k = 3
+                sorted_neighbors = sorted(neighbor_scores, key=neighbor_scores.get, reverse=True)
+                candidates = sorted_neighbors[:min(top_k, len(sorted_neighbors))]
+                best_forwarder_id = self.gnn.mab_select_forwarder(candidates)
+                if best_forwarder_id in self.gnn.neighbors:
+                    forwarder = next((n for n in config_nodes if n.node_id == best_forwarder_id), None)
+                    if forwarder:
+                        # Create a new frame with incremented hop count
+                        new_frame = self.construct_oppdata_frame(oppdata.dst_id, hops=hops+1)
+                        new_frame["payload"] = oppdata  # Preserve original data
+                        forwarder.forwarding_queue.append(new_frame)
+                        reward = 1.0 if forwarder.node_id == oppdata.dst_id else 0.0
+                        self.gnn.mab_update(best_forwarder_id, reward)
+                        # Optionally print forwarding
+                        print(f"Node {self.node_id} forwarded OppData to {oppdata.dst_id} via {best_forwarder_id} (hops={hops+1})")
+                else:
+                    # No valid neighbor, drop
+                    pass
+            else:
+                # No neighbors, drop
+                pass
+        self.forwarding_queue = new_queue  # Clear queue after processing
 
 class Configuration:
     def __init__(self, num_nodes=2):
@@ -232,6 +321,16 @@ class Hello:
 
     def __repr__(self):
         return f"Hello(node_id={self.node_id}, x={self.x}, y={self.y}, z={self.z})"
+
+class OppData:
+    """Holds opportunistic data for a node to send to a destination."""
+    def __init__(self, src_id, dst_id, data=None):
+        self.src_id = src_id
+        self.dst_id = dst_id
+        self.data = data if data is not None else random.random()
+
+    def __repr__(self):
+        return f"OppData(src_id={self.src_id}, dst_id={self.dst_id}, data={self.data:.3f})"
 
 class IPv4Header:
     """Represents an IPv4 header."""
@@ -334,11 +433,15 @@ def plot_node_positions(nodes, step, cmap_name='viridis'):
     plt.show()
 
 if __name__ =="__main__":
-    config = Configuration(num_nodes=100)
+    config = Configuration(num_nodes=50)
     mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=40)
     cell_size = 250
     spatial_grid = SpatialGrid(cell_size)
-    for step in range(5):
+    steps = 5
+    packets_per_step = 10
+    pdr_list = []
+
+    for step in range(steps):
         mobility.step()
         spatial_grid.assign_nodes(config.nodes)
         # Each node constructs a frame and "sends" only to nodes within radio range
@@ -351,18 +454,52 @@ if __name__ =="__main__":
         for node in config.nodes:
             print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
         print("-" * 40)
-        # Plot node positions with color difference and numbering
         plot_node_positions(config.nodes, step)
 
         # --- Feedback collection and online_update integration ---
-        # Simulate feedback: for each node, assign random feedback to its neighbors
         for node in config.nodes:
             node.gnn.update_neighbors()  # Ensure neighbor_features are up-to-date
             feedback = {}
-            for neighbor_id in node.gnn.neighbors:
-                # Simulate feedback: 1 for "success", 0 for "fail" (random for demo)
+            # Only include feedback for neighbors present in neighbor_features
+            valid_neighbors = set(node.gnn.neighbor_features.keys())
+            for neighbor_id in valid_neighbors:
                 feedback[neighbor_id] = random.choice([0.0, 1.0])
             node.gnn.online_update(feedback)
+
+        # --- Opportunistic Data Transmission Simulation (Multi-hop) ---
+        # Send 10 oppdata frames per step using MAB, add to queue
+        delivered_packets = []
+        for _ in range(packets_per_step):
+            src, dst = random.sample(config.nodes, 2)
+            opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0)
+            src.forwarding_queue.append(opp_frame)
+
+        # Multi-hop forwarding: process all queues until no packets left or max hops reached
+        max_hops = 10
+        for hop in range(max_hops):
+            active = False
+            for node in config.nodes:
+                if node.forwarding_queue:
+                    active = True
+                    node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=max_hops)
+            if not active:
+                break  # No more packets to forward
+
+        pdr = len(delivered_packets) / packets_per_step
+        pdr_list.append(pdr)
+        print(f"Step {step}: PDR = {pdr:.2f}")
+        print("="*60)
+
+    # --- Plot PDR over steps ---
+    plt.figure(figsize=(7,4))
+    plt.plot(range(steps), pdr_list, marker='o')
+    plt.title("Packet Delivery Ratio (PDR) per Step")
+    plt.xlabel("Step")
+    plt.ylabel("PDR")
+    plt.ylim(0, 1.05)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 
 
