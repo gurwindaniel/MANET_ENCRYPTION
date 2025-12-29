@@ -825,6 +825,7 @@ if __name__ =="__main__":
     regret_list = []
     energy_consumption_list = []
     routing_overhead_list = []
+    forwarding_attempts = 0  # Track actual forwarding attempts
 
     cumulative_reward = 0.0
     optimal_reward_per_step = packets_per_step  # Assume optimal = all packets delivered (reward=1 per packet)
@@ -913,20 +914,87 @@ if __name__ =="__main__":
         delivered_packets = []
         packet_delays = []
         packet_sent_time = {}
+        packet_hop_count = {}  # Track hops for each packet
         for _ in range(packets_per_step):
             src, dst = random.sample(config.nodes, 2)
             is_last = random.random() < 0.1
             opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0, is_last_packet=is_last)
             src.forwarding_queue.append(opp_frame)
-            packet_sent_time[(src.node_id, dst.node_id, is_last)] = current_time
+            packet_key = (src.node_id, dst.node_id, is_last)
+            packet_sent_time[packet_key] = current_time
+            packet_hop_count[packet_key] = 0
 
+        # --- Forwarding with energy consumption and forwarding attempt tracking ---
         for node in config.nodes:
-            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets)
+            new_queue = []
+            for frame in node.forwarding_queue:
+                oppdata = frame["payload"]
+                hops = frame.get("hops", 0)
+                packet_key = (oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet)
+                # --- Ensure packet_hop_count and packet_sent_time are initialized for forwarded packets ---
+                if packet_key not in packet_sent_time:
+                    packet_sent_time[packet_key] = current_time
+                if packet_key not in packet_hop_count:
+                    packet_hop_count[packet_key] = hops
+                if hops >= 50:
+                    continue  # Drop packet if max hops exceeded
+                if node.receive_oppdata_frame(frame):
+                    delivered_packets.append((oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet))
+                    # Delay calculation will use packet_sent_time below
+                    continue
+                node.gnn.update_neighbors()
+                neighbor_scores = node.gnn.compute_embeddings()
+                if neighbor_scores:
+                    dst_node = next((n for n in config.nodes if n.node_id == oppdata.dst_id), None)
+                    my_pos = np.array([node.x, node.y, node.z])
+                    dst_pos = np.array([dst_node.x, dst_node.y, dst_node.z])
+                    progress_candidates = [
+                        nid for nid in neighbor_scores
+                        if np.linalg.norm(
+                            np.array([
+                                next((n for n in config.nodes if n.node_id == nid), None).x,
+                                next((n for n in config.nodes if n.node_id == nid), None).y,
+                                next((n for n in config.nodes if n.node_id == nid), None).z
+                            ]) - dst_pos
+                        ) < np.linalg.norm(my_pos - dst_pos)
+                    ]
+                    if progress_candidates:
+                        best_forwarder_id = node.gnn.mab_select_forwarder(progress_candidates, dst_node=dst_node)
+                        if best_forwarder_id in node.gnn.neighbors:
+                            forwarder = next((n for n in config.nodes if n.node_id == best_forwarder_id), None)
+                            if forwarder:
+                                new_frame = node.construct_oppdata_frame(oppdata.dst_id, hops=hops+1, is_last_packet=oppdata.is_last_packet)
+                                new_frame["payload"] = oppdata  # Preserve original data
+                                # --- Propagate packet_key metadata to forwarded packet ---
+                                forwarder.forwarding_queue.append(new_frame)
+                                node.energy -= 0.01  # Transmission cost (tune as needed)
+                                forwarder.energy -= 0.005  # Reception cost (tune as needed)
+                                forwarding_attempts += 1
+                                packet_hop_count[packet_key] += 1
+                                reward = 1.0 if forwarder.node_id == oppdata.dst_id else 0.0
+                                node.gnn.mab_update(
+                                    best_forwarder_id, reward,
+                                    src_node=node,
+                                    dst_node=dst_node,
+                                    forwarder_node=forwarder
+                                )
+                            else:
+                                new_queue.append(frame)
+                        else:
+                            new_queue.append(frame)
+                    else:
+                        new_queue.append(frame)
+                else:
+                    new_queue.append(frame)
+            node.forwarding_queue = new_queue
 
-        # --- End-to-end delay calculation ---
+        # --- End-to-end delay calculation (use true send time) ---
         for src_id, dst_id, is_last_packet in delivered_packets:
-            sent_time = packet_sent_time.get((src_id, dst_id, is_last_packet), current_time)
+            packet_key = (src_id, dst_id, is_last_packet)
+            sent_time = packet_sent_time.get(packet_key, current_time)
             delay = current_time - sent_time + time_per_step_seconds
+            # If delivered in the same step, delay = time_per_step_seconds; if multi-hop, delay increases
+            delay += (packet_hop_count.get(packet_key, 0) * time_per_step_seconds)
             packet_delays.append(delay)
         avg_delay_per_sec = (np.mean(packet_delays) / time_per_step_seconds) if packet_delays else 0.0
         delay_list.append(avg_delay_per_sec)
@@ -951,20 +1019,23 @@ if __name__ =="__main__":
         avg_reward = np.mean(mab_rewards) if mab_rewards else 0.0
         reward_list.append(avg_reward)
         mab_avg_reward_list.append(avg_reward)
-        cumulative_reward += total_step_reward
-        cumulative_reward_list.append(cumulative_reward)
+
+        # --- Regret calculation: use delivered packets as actual reward ---
+        cumulative_reward += len(delivered_packets)
         cumulative_optimal_reward += optimal_reward_per_step
         regret = cumulative_optimal_reward - cumulative_reward
+        regret = max(regret, 0.0)  # Ensure non-negative
+        cumulative_reward_list.append(cumulative_reward)
         regret_list.append(regret)
 
         # --- Energy Consumption ---
-        total_energy = sum([100.0 - node.energy for node in config.nodes])  # Assuming initial energy is 100.0
+        total_energy = sum([100.0 - node.energy for node in config.nodes])  # Now reflects actual consumption
         energy_consumption_list.append(total_energy)
 
-        # --- Routing Overhead ---
-        total_forwarding = sum([len(node.forwarding_queue) for node in config.nodes]) + len(delivered_packets)
-        routing_overhead = (total_forwarding / len(delivered_packets)) if delivered_packets else 0.0
+        # --- Routing Overhead: use actual forwarding attempts ---
+        routing_overhead = (forwarding_attempts / len(delivered_packets)) if delivered_packets else 0.0
         routing_overhead_list.append(routing_overhead)
+        forwarding_attempts = 0  # Reset for next step
 
         # --- GNN loss already calculated ---
         # --- Print step metrics ---
