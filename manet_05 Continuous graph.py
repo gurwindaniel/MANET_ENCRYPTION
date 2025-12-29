@@ -867,8 +867,13 @@ if __name__ =="__main__":
             current_neighbors_ids = {r.node_id for r in receivers} # Get current neighbors for link tracking
             sender.update_link_state_tracker(current_time, current_neighbors_ids, config.nodes)
 
-            for receiver in receivers:
-                receiver.receive_frame(frame)
+        # --- Online TGNN training step for each node ---
+        tgnn_losses = []
+        for node in config.nodes:
+            loss = node.tgnn_train_step()
+            if loss is not None:
+                tgnn_losses.append(loss)
+        # Optionally, you can log tgnn_losses if desired
 
         # --- CTDG update ---
         for node in config.nodes:
