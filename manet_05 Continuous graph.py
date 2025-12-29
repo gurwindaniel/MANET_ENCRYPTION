@@ -86,6 +86,7 @@ class OnlineGNN:
         id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
         x = [np.array([self.node.x, self.node.y, self.node.z, getattr(self.node, 'energy', 100.0), 0.0], dtype=np.float32)]
         x += [self.neighbor_features[nid] for nid in self.neighbor_features]
+        x = np.array(x, dtype=np.float32)  # Convert list to numpy array first
         x = torch.tensor(x, dtype=torch.float32).to(device) # Move tensor to device
         # Fully connect self to neighbors (undirected)
         edge_index = []
@@ -750,6 +751,55 @@ def plot_node_positions(nodes, step, cmap_name='viridis'):
     plt.tight_layout()
     plt.show()
 
+class CTDGTracker:
+    """
+    Tracks the appearance and disappearance of edges (neighbor relationships) over continuous time.
+    Stores for each node: {neighbor_id: [(start_time, end_time), ...]}
+    """
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.edge_intervals = {node.node_id: {} for node in nodes}  # node_id: {neighbor_id: [(start, end), ...]}
+        self.active_edges = {node.node_id: {} for node in nodes}    # node_id: {neighbor_id: start_time}
+
+    def update(self, current_time):
+        # For each node, update edge intervals based on current neighbors
+        for node in self.nodes:
+            node_id = node.node_id
+            current_neighbors = set(node.gnn.get_neighbors())
+            prev_neighbors = set(self.active_edges[node_id].keys())
+
+            # New edges (appeared)
+            for neighbor_id in current_neighbors - prev_neighbors:
+                self.active_edges[node_id][neighbor_id] = current_time
+
+            # Edges that disappeared
+            for neighbor_id in prev_neighbors - current_neighbors:
+                start_time = self.active_edges[node_id].pop(neighbor_id)
+                if neighbor_id not in self.edge_intervals[node_id]:
+                    self.edge_intervals[node_id][neighbor_id] = []
+                self.edge_intervals[node_id][neighbor_id].append((start_time, current_time))
+
+    def finalize(self, final_time):
+        # Close any open intervals at the end of simulation
+        for node_id, neighbors in self.active_edges.items():
+            for neighbor_id, start_time in neighbors.items():
+                if neighbor_id not in self.edge_intervals[node_id]:
+                    self.edge_intervals[node_id][neighbor_id] = []
+                self.edge_intervals[node_id][neighbor_id].append((start_time, final_time))
+        self.active_edges = {node_id: {} for node_id in self.active_edges}
+
+    def get_edge_intervals(self, node_id, neighbor_id):
+        return self.edge_intervals.get(node_id, {}).get(neighbor_id, [])
+
+    def get_all_events(self):
+        # Returns a list of (node_id, neighbor_id, start, end) for all edges
+        events = []
+        for node_id, neighbors in self.edge_intervals.items():
+            for neighbor_id, intervals in neighbors.items():
+                for start, end in intervals:
+                    events.append((node_id, neighbor_id, start, end))
+        return events
+
 if __name__ =="__main__":
     config = Configuration(num_nodes=120)
     mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=30)  # Increased speed
@@ -761,18 +811,20 @@ if __name__ =="__main__":
 
     spatial_grid = SpatialGrid(cell_size)
 
+    # --- CTDG tracker initialization ---
+    ctdg_tracker = CTDGTracker(config.nodes)
+
     # --- Metrics storage ---
     pdr_list = []
     throughput_list = []
     delay_list = []
     gnn_loss_list = []
     mab_avg_reward_list = []
-    tgnn_loss_list = []  # Add TGNN loss tracking
-    reward_list = []            # Average reward per step (already tracked as mab_avg_reward_list)
-    cumulative_reward_list = [] # Cumulative reward per step
-    regret_list = []            # Regret per step
-    energy_consumption_list = []# Energy consumption per step
-    routing_overhead_list = []  # Routing overhead per step
+    reward_list = []
+    cumulative_reward_list = []
+    regret_list = []
+    energy_consumption_list = []
+    routing_overhead_list = []
 
     cumulative_reward = 0.0
     optimal_reward_per_step = packets_per_step  # Assume optimal = all packets delivered (reward=1 per packet)
@@ -795,6 +847,10 @@ if __name__ =="__main__":
                 neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
                 feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
             node.gnn.online_update(feedback)
+        # --- CTDG update for pretrain (optional, can skip if only main sim is tracked) ---
+        for node in config.nodes:
+            node.gnn.update_neighbors()
+        ctdg_tracker.update(_ * time_per_step_seconds)  # Use pretrain time
 
     # --- Main simulation ---
     for step in range(steps):
@@ -813,11 +869,11 @@ if __name__ =="__main__":
 
             for receiver in receivers:
                 receiver.receive_frame(frame)
-        # Commented out for performance
-        # for node in config.nodes:
-        #     print(f"Node {node.node_id} neighbors: {len(node.gnn.get_neighbors())} -> {sorted(node.gnn.get_neighbors())}")
-        # print("-" * 40)
-        # plot_node_positions(config.nodes, step)
+
+        # --- CTDG update ---
+        for node in config.nodes:
+            node.gnn.update_neighbors()
+        ctdg_tracker.update(current_time)
 
         # --- GNN performance metric: average MSE loss per node per step ---
         gnn_losses = []
@@ -854,22 +910,19 @@ if __name__ =="__main__":
         packet_sent_time = {}
         for _ in range(packets_per_step):
             src, dst = random.sample(config.nodes, 2)
-            # Randomly set is_last_packet for demonstration, e.g., 10% chance
             is_last = random.random() < 0.1
             opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0, is_last_packet=is_last)
             src.forwarding_queue.append(opp_frame)
-            # Record send time for delay calculation, including is_last_packet for uniqueness if needed
-            packet_sent_time[(src.node_id, dst.node_id, is_last)] = current_time # Use current_time for sent time
+            packet_sent_time[(src.node_id, dst.node_id, is_last)] = current_time
 
         for node in config.nodes:
-            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets, max_hops=50)
+            node.forward_oppdata(config.nodes, spatial_grid, delivered_packets)
 
         # --- End-to-end delay calculation ---
         for src_id, dst_id, is_last_packet in delivered_packets:
             sent_time = packet_sent_time.get((src_id, dst_id, is_last_packet), current_time)
             delay = current_time - sent_time + time_per_step_seconds
             packet_delays.append(delay)
-        # Calculate average delay per second (not per step)
         avg_delay_per_sec = (np.mean(packet_delays) / time_per_step_seconds) if packet_delays else 0.0
         delay_list.append(avg_delay_per_sec)
 
@@ -881,7 +934,8 @@ if __name__ =="__main__":
         pdr = len(delivered_packets) / packets_per_step if packets_per_step > 0 else 0.0
         pdr_list.append(pdr)
 
-        # --- MAB performance: average reward per node per step ---
+        # --- Reward, Cumulative Reward, Regret ---
+        # Reward: average reward per step (MAB)
         mab_rewards = []
         total_step_reward = 0.0
         for node in config.nodes:
@@ -890,10 +944,8 @@ if __name__ =="__main__":
                 mab_rewards.extend(rewards)
                 total_step_reward += sum([node.gnn.mab_rewards.get(nid, 0) for nid in node.gnn.mab_counts])
         avg_reward = np.mean(mab_rewards) if mab_rewards else 0.0
-        mab_avg_reward_list.append(avg_reward)
         reward_list.append(avg_reward)
-
-        # --- Cumulative Reward and Regret ---
+        mab_avg_reward_list.append(avg_reward)
         cumulative_reward += total_step_reward
         cumulative_reward_list.append(cumulative_reward)
         cumulative_optimal_reward += optimal_reward_per_step
@@ -905,29 +957,23 @@ if __name__ =="__main__":
         energy_consumption_list.append(total_energy)
 
         # --- Routing Overhead ---
-        # Define as total number of forwarding attempts / delivered packets
         total_forwarding = sum([len(node.forwarding_queue) for node in config.nodes]) + len(delivered_packets)
         routing_overhead = (total_forwarding / len(delivered_packets)) if delivered_packets else 0.0
         routing_overhead_list.append(routing_overhead)
 
-        # --- TGNN training and loss ---
-        tgnn_losses = []
-        for node in config.nodes:
-            tgnn_loss = node.tgnn_train_step()
-            if tgnn_loss is not None:
-                tgnn_losses.append(tgnn_loss)
-        tgnn_loss_list.append(np.mean(tgnn_losses) if tgnn_losses else 0.0)
-
-        print(f"Step {step}: PDR = {len(delivered_packets)}/{packets_per_step} ({pdr:.2f}), "
+        # --- GNN loss already calculated ---
+        # --- Print step metrics ---
+        print(f"Step {step}: "
+              f"PDR = {len(delivered_packets)}/{packets_per_step} ({pdr:.2f}), "
               f"Throughput = {throughput_mbps:.3f} Mbps, "
               f"Avg End-to-End Delay = {avg_delay_per_sec:.3f} s, "
-              f"GNN Loss = {gnn_loss_list[-1]:.4f}, TGNN Loss = {tgnn_loss_list[-1]:.4f}, "
+              f"GNN Loss = {gnn_loss_list[-1]:.4f}, "
               f"MAB Avg Reward = {avg_reward:.3f}, "
               f"Cumulative Reward = {cumulative_reward:.2f}, Regret = {regret:.2f}, "
               f"Energy Consumption = {total_energy:.2f}, Routing Overhead = {routing_overhead:.2f}")
         print("="*60)
 
-    # Print overall metrics after all steps
+    # --- Print overall metrics after all steps ---
     total_packets_sent = packets_per_step * steps
     total_packets_received = int(np.sum(np.array(pdr_list) * packets_per_step))
     avg_pdr = total_packets_received / total_packets_sent if total_packets_sent > 0 else 0.0
@@ -935,7 +981,6 @@ if __name__ =="__main__":
     print(f"Average Throughput: {np.mean(throughput_list):.3f} Mbps")
     print(f"Average End-to-End Delay per Second: {np.mean(delay_list):.3f} s")
     print(f"Average GNN Loss: {np.mean(gnn_loss_list):.6f}")
-    print(f"Average TGNN Loss: {np.mean(tgnn_loss_list):.6f}")
     print(f"Average MAB Reward: {np.mean(mab_avg_reward_list):.6f}")
     print(f"Final Cumulative Reward: {cumulative_reward:.2f}")
     print(f"Final Regret: {regret_list[-1]:.2f}")
@@ -980,15 +1025,7 @@ if __name__ =="__main__":
     plt.show()
 
     plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=tgnn_loss_list, marker='o', color='brown')
-    plt.title("TGNN Performance: Average MSE Loss per Step")
-    plt.xlabel("Step")
-    plt.ylabel("MSE Loss")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=mab_avg_reward_list, marker='o', color='purple')
+    sns.lineplot(x=steps_range, y=reward_list, marker='o', color='purple')
     plt.title("MAB Performance: Average Reward per Step")
     plt.xlabel("Step")
     plt.ylabel("Average Reward")
