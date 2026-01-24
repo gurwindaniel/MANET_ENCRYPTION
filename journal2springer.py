@@ -366,22 +366,8 @@ class Node:
                 # Drop distance update packet if TTL expired
                 continue
 
-
-            # Use the bloom filter to check if this node has already processed this update
-            if update_packet.visited_nodes.might_contain(self.mac_address):
-                # This node has already processed this update, drop it to avoid loops/duplicates
-                continue
-
-            # Add this node's MAC address to the bloom filter to mark it as visited
-            update_packet.visited_nodes.add(self.mac_address)
-
-
             # If this node is the original source of the packet that triggered this update
             if update_packet.destination_ip == self.ip_address:
-                # Update the known distance for the destination reported by the intermediate node
-                # The distance in the update packet is the distance from the sender of the update
-                # to the original destination. We can store this as the known distance to the sender.
-                # Now using original_opp_destination_ip from the update packet
                 self.known_destinations[update_packet.original_opp_destination_ip] = update_packet.distance
 
             else:
@@ -395,12 +381,10 @@ class Node:
                 original_source_node = next((n for n in config.nodes if n.ip_address == update_packet.destination_ip), None)
                 if original_source_node:
                     forwarder_candidates = [
-                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts # Consider all neighbors from hello packets
-                        if not update_packet.visited_nodes.might_contain(pkt.node.mac_address) and # Check if neighbor was already visited by this update
-                           self.distance_to(pkt.node) <= 250 and # Neighbor is within communication range
-                           self.energy > 1 # Current node has energy to forward (lowered threshold)
-                           # Greedy forwarding: Neighbor must be closer to the destination (original source)
-                           and pkt.node.distance_to(original_source_node) < self.distance_to(original_source)
+                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts
+                        if self.distance_to(pkt.node) <= 250
+                        and self.energy > 1
+                        and pkt.node.distance_to(original_source_node) < self.distance_to(original_source_node)
                     ]
 
                     if forwarder_candidates:
@@ -412,7 +396,6 @@ class Node:
                         # Attempt to forward the update packet to the next hop
                         # In a real simulation, this would involve adding to the next hop's queue
                         next_hop_for_update.distance_update_queue.append(update_packet)
-                        # print(f"Node {self.node_id} forwarded DistanceUpdate to {next_hop_for_update.node_id} towards {original_source_node.node_id}")
                     else:
                         # No suitable forwarder found, the update packet might be dropped or re-queued
                         # For now, let's re-queue it, hoping for better opportunities later
@@ -424,7 +407,6 @@ class Node:
                     # print(f"Node {self.node_id} received DistanceUpdate for unknown source {update_packet.destination_ip}, dropping.")
                     pass
                 # ------------------------------------------------------------------------------------------
-
 
         self.distance_update_queue.extend(processed_updates) # Add updates back that weren't processed/dropped
 
@@ -834,22 +816,8 @@ class Node:
                 # Drop distance update packet if TTL expired
                 continue
 
-
-            # Use the bloom filter to check if this node has already processed this update
-            if update_packet.visited_nodes.might_contain(self.mac_address):
-                # This node has already processed this update, drop it to avoid loops/duplicates
-                continue
-
-            # Add this node's MAC address to the bloom filter to mark it as visited
-            update_packet.visited_nodes.add(self.mac_address)
-
-
             # If this node is the original source of the packet that triggered this update
             if update_packet.destination_ip == self.ip_address:
-                # Update the known distance for the destination reported by the intermediate node
-                # The distance in the update packet is the distance from the sender of the update
-                # to the original destination. We can store this as the known distance to the sender.
-                # Now using original_opp_destination_ip from the update packet
                 self.known_destinations[update_packet.original_opp_destination_ip] = update_packet.distance
 
             else:
@@ -863,12 +831,10 @@ class Node:
                 original_source_node = next((n for n in config.nodes if n.ip_address == update_packet.destination_ip), None)
                 if original_source_node:
                     forwarder_candidates = [
-                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts # Consider all neighbors from hello packets
-                        if not update_packet.visited_nodes.might_contain(pkt.node.mac_address) and # Check if neighbor was already visited by this update
-                           self.distance_to(pkt.node) <= 250 and # Neighbor is within communication range
-                           self.energy > 1 # Current node has energy to forward (lowered threshold)
-                           # Greedy forwarding: Neighbor must be closer to the destination (original source)
-                           and pkt.node.distance_to(original_source_node) < self.distance_to(original_source)
+                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts
+                        if self.distance_to(pkt.node) <= 250
+                        and self.energy > 1
+                        and pkt.node.distance_to(original_source_node) < self.distance_to(original_source_node)
                     ]
 
                     if forwarder_candidates:
@@ -880,7 +846,6 @@ class Node:
                         # Attempt to forward the update packet to the next hop
                         # In a real simulation, this would involve adding to the next hop's queue
                         next_hop_for_update.distance_update_queue.append(update_packet)
-                        # print(f"Node {self.node_id} forwarded DistanceUpdate to {next_hop_for_update.node_id} towards {original_source_node.node_id}")
                     else:
                         # No suitable forwarder found, the update packet might be dropped or re-queued
                         # For now, let's re-queue it, hoping for better opportunities later
@@ -892,7 +857,6 @@ class Node:
                     # print(f"Node {self.node_id} received DistanceUpdate for unknown source {update_packet.destination_ip}, dropping.")
                     pass
                 # ------------------------------------------------------------------------------------------
-
 
         self.distance_update_queue.extend(processed_updates) # Add updates back that weren't processed/dropped
 
@@ -1335,22 +1299,8 @@ class Node:
                 # Drop distance update packet if TTL expired
                 continue
 
-
-            # Use the bloom filter to check if this node has already processed this update
-            if update_packet.visited_nodes.might_contain(self.mac_address):
-                # This node has already processed this update, drop it to avoid loops/duplicates
-                continue
-
-            # Add this node's MAC address to the bloom filter to mark it as visited
-            update_packet.visited_nodes.add(self.mac_address)
-
-
             # If this node is the original source of the packet that triggered this update
             if update_packet.destination_ip == self.ip_address:
-                # Update the known distance for the destination reported by the intermediate node
-                # The distance in the update packet is the distance from the sender of the update
-                # to the original destination. We can store this as the known distance to the sender.
-                # Now using original_opp_destination_ip from the update packet
                 self.known_destinations[update_packet.original_opp_destination_ip] = update_packet.distance
 
             else:
@@ -1364,12 +1314,10 @@ class Node:
                 original_source_node = next((n for n in config.nodes if n.ip_address == update_packet.destination_ip), None)
                 if original_source_node:
                     forwarder_candidates = [
-                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts # Consider all neighbors from hello packets
-                        if not update_packet.visited_nodes.might_contain(pkt.node.mac_address) and # Check if neighbor was already visited by this update
-                           self.distance_to(pkt.node) <= 250 and # Neighbor is within communication range
-                           self.energy > 1 # Current node has energy to forward (lowered threshold)
-                           # Greedy forwarding: Neighbor must be closer to the destination (original source)
-                           and pkt.node.distance_to(original_source_node) < self.distance_to(original_source)
+                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts
+                        if self.distance_to(pkt.node) <= 250
+                        and self.energy > 1
+                        and pkt.node.distance_to(original_source_node) < self.distance_to(original_source_node)
                     ]
 
                     if forwarder_candidates:
@@ -1381,7 +1329,6 @@ class Node:
                         # Attempt to forward the update packet to the next hop
                         # In a real simulation, this would involve adding to the next hop's queue
                         next_hop_for_update.distance_update_queue.append(update_packet)
-                        # print(f"Node {self.node_id} forwarded DistanceUpdate to {next_hop_for_update.node_id} towards {original_source_node.node_id}")
                     else:
                         # No suitable forwarder found, the update packet might be dropped or re-queued
                         # For now, let's re-queue it, hoping for better opportunities later
@@ -1393,7 +1340,6 @@ class Node:
                     # print(f"Node {self.node_id} received DistanceUpdate for unknown source {update_packet.destination_ip}, dropping.")
                     pass
                 # ------------------------------------------------------------------------------------------
-
 
         self.distance_update_queue.extend(processed_updates) # Add updates back that weren't processed/dropped
 
@@ -1967,10 +1913,8 @@ for speed in speeds_to_simulate:
     metrics_for_speed['Avg Initial TTL'] = avg_initial_ttl_results.get(speed)
     metrics_for_speed['Avg Final TTL'] = avg_final_ttl_results.get(speed)
 
-
     # 10. Simulation Duration
     metrics_for_speed['Simulation Duration (s)'] = simulation_duration_results.get(speed)
-
 
     # Store the collected metrics for this speed
     performance_metrics_summary[speed] = metrics_for_speed
