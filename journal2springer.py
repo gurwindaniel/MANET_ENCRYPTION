@@ -22,6 +22,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.data import Data as PyGData
 from torch_geometric.nn import NNConv, GCNConv
+import csv
+import os
 
 # === Custom Online TGNN Model (NNConv + edge features) ===
 class CustomOnlineTGNN(nn.Module):
@@ -141,61 +143,19 @@ class CustomOnlineTGNN(nn.Module):
             best_idx = candidate_indices[int(np.argmax(candidate_scores))]
             return nodes_features[best_idx][0]
 
-# === Bloom Filter Implementation ===
-class BloomFilter:
-    def __init__(self, capacity, error_rate):
-        self.capacity = capacity
-        self.error_rate = error_rate
-
-        m_optimal = int(-(capacity * math.log(error_rate)) / (math.log(2)**2))
-        k_optimal = int((m_optimal / capacity) * math.log(2))
-
-        self.m = min(max(m_optimal, 256), 1024) # Increase bit array for lower false positive
-        self.k = max(4, int((self.m / capacity) * math.log(2))) # Increase hash functions
-
-        self.m = (self.m + 7) // 8 * 8
-        self.bit_array = bytearray(self.m // 8)
-
-    def _hash(self, element, seed):
-        """Compute a hash value for the element using MurmurHash3."""
-        # Using MurmurHash3 because it's fast and has good distribution
-        # Ensure element is hashable (e.g., convert to string)
-        return mmh3.hash(str(element), seed) % self.m
-
-    def add(self, element):
-        """Add an element to the bloom filter."""
-        for i in range(self.k):
-            index = self._hash(element, i)
-            byte_index = index // 8
-            bit_offset = index % 8
-            self.bit_array[byte_index] |= (1 << bit_offset)
-
-    def might_contain(self, element):
-        """Check if an element might be in the bloom filter."""
-        for i in range(self.k):
-            index = self._hash(element, i)
-            byte_index = index // 8
-            bit_offset = index % 8
-            if not (self.bit_array[byte_index] & (1 << bit_offset)):
-                return False # Definitely not in the set
-        return True # Possibly in the set (could be a false positive)
-
 # === Packet Classes ===
 class OppPacket:
-    def __init__(self, source_ip, destination_ip, ttl, source_mac_address, source_x, source_y, source_z): # Added source_mac_address and position
-        self.source_ip = source_ip # Original source IP
+    def __init__(self, source_ip, destination_ip, ttl, source_mac_address, source_x, source_y, source_z):
+        self.source_ip = source_ip
         self.destination_ip = destination_ip
         self.ttl = ttl
-        # Add creation timestamp
         self.creation_timestamp = datetime.now()
-        self.visited_nodes = BloomFilter(capacity=100, error_rate=0.01)
-        self.initial_ttl = ttl # Store initial TTL for analysis
-        self.delivered = False # Track if the packet has been delivered
-        self.current_hop_mac = source_mac_address # Store the MAC of the current node holding/forwarding the packet
+        self.initial_ttl = ttl
+        self.delivered = False
+        self.current_hop_mac = source_mac_address
         self.source_x = source_x
         self.source_y = source_y
         self.source_z = source_z
-
 
 class HelloPacket:
     def __init__(self, source_ip, source_mac, x, y, z, timestamp, distance, node):
@@ -213,25 +173,22 @@ class HelloPacket:
 
 class DistanceUpdatePacket:
     def __init__(self, source_ip, destination_ip, distance, visited_nodes_bloom_filter, original_opp_destination_ip):
-        self.source_ip = source_ip # The node sending the update (likely the destination or an intermediate node)
-        self.destination_ip = destination_ip # The original source node of the OppPacket
-        self.distance = distance # The distance from the source_ip of this update packet to the original destination
+        self.source_ip = source_ip
+        self.destination_ip = destination_ip
+        self.distance = distance
         self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        self.visited_nodes = visited_nodes_bloom_filter # Carry the bloom filter for the RETURN path
-        self.original_opp_destination_ip = original_opp_destination_ip # Add original destination IP
-        self.ttl = 50 # Add TTL for distance update packets (arbitrary initial value)
-
+        self.visited_nodes = visited_nodes_bloom_filter
+        self.original_opp_destination_ip = original_opp_destination_ip
+        self.ttl = 50
 
 # === Node Class ===
 class Node:
     packet_sent_count = 0
     packet_delivered_count = 0
     drop_count = 0
-    delivered_packets = [] # List to store info about delivered packets
-    # Add lists to store packet and visited_nodes sizes for delivered packets
+    delivered_packets = []
     delivered_packet_sizes = []
-    delivered_visited_nodes_sizes = []
-
+    delivered_visited_nodes_sizes = [] # Will be unused, can be removed
 
     def __init__(self, ip_address, mac_address, x, y, z, node_id):
         self.mac_address = mac_address
@@ -415,9 +372,12 @@ class Node:
         """Creates and queues an opportunistic packet for sending with adaptive TTL."""
         destination_node = next((n for n in config.nodes if n.ip_address == destination_ip), None)
         if destination_node:
+            # Only send if distance to destination is greater than 250 meters
+            base_distance = self.distance_to(destination_node)
+            if base_distance <= 250:
+                return False
             # --- Adaptive TTL based on neighbor count and TGNN suggestion ---
             neighbor_count = sum(1 for pkts in self.queue.values() for _ in pkts)
-            base_distance = self.distance_to(destination_node)
             # Prepare dummy features for TTL prediction
             nodes_features = [
                 [self.node_id, self.x, self.y, self.z, self.energy, 1.0, 0, 0, 0, self.energy, 0, base_distance]
@@ -489,7 +449,6 @@ class Node:
     def tgnn_forward(self, opp_packet):
         """Uses GNN-based neighbor scoring for next-hop selection (progress-only)."""
         current_node = self
-        opp_packet.visited_nodes.add(current_node.mac_address)
         opp_packet.current_hop_mac = current_node.mac_address
 
         # 1. Check if destination
@@ -500,525 +459,41 @@ class Node:
             Node.packet_delivered_count += 1
             print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {datetime.now()}")
 
-            # Collect visited_nodes size at destination
-            visited_nodes_size = 0
-            if hasattr(opp_packet, 'visited_nodes') and isinstance(opp_packet.visited_nodes, BloomFilter):
-                 visited_nodes_size = sys.getsizeof(opp_packet.visited_nodes.bit_array) + sys.getsizeof(opp_packet.visited_nodes)
-
-            # Log delivered packet info
             Node.delivered_packets.append({
                 'initial_ttl': opp_packet.initial_ttl,
                 'final_ttl': opp_packet.ttl,
                 'hops_used': opp_packet.initial_ttl - opp_packet.ttl,
-                'creation_timestamp': opp_packet.creation_timestamp, # Log creation timestamp
-                'delivery_timestamp': datetime.now(), # Log delivery timestamp
-                'visited_nodes_size': visited_nodes_size # Include visited nodes size
+                'creation_timestamp': opp_packet.creation_timestamp,
+                'delivery_timestamp': datetime.now()
             })
 
-            # Collect packet size at destination (Python object size)
             packet_size = sys.getsizeof(opp_packet) + sum(sys.getsizeof(attr_value) for attr_value in opp_packet.__dict__.values())
             Node.delivered_packet_sizes.append(packet_size)
-            # Collect visited_nodes size at destination (Python object size)
-            Node.delivered_visited_nodes_sizes.append(visited_nodes_size)
 
+            current_node.opp_dest_packet.append(opp_packet)
+            current_node.packets = np.append(current_node.packets, opp_packet)
 
-            current_node.opp_dest_packet.append(opp_packet) # Store delivered packet at destination
-            current_node.packets = np.append(current_node.packets, opp_packet) # Still keep in packets for history
-
-
-            # --- Step 3: Create and send distance update back to source using a NEW bloom filter ---
-            # Calculate distance back to source using position from OppPacket
+            # --- Step 3: Create and send distance update back to source ---
             distance_back_to_source = math.sqrt(
                 (current_node.x - opp_packet.source_x)**2 +
                 (current_node.y - opp_packet.source_y)**2 +
                 (current_node.z - opp_packet.source_z)**2
             )
 
-            # Create a NEW bloom filter for the distance update packet's return journey
-            update_bloom_filter = BloomFilter(capacity=100, error_rate=0.01)
-            # Add the current node (destination) to the update packet's bloom filter
-            update_bloom_filter.add(current_node.mac_address)
-
-
             update_pkt = DistanceUpdatePacket(
-                source_ip=current_node.ip_address, # Destination is the source of the update
-                destination_ip=opp_packet.source_ip, # Send back to original source
-                distance=distance_back_to_source, # Use calculated distance back to source
-                visited_nodes_bloom_filter=update_bloom_filter, # Include the NEW visited nodes bloom filter for the return path
-                original_opp_destination_ip=opp_packet.destination_ip # Include original destination IP
+                source_ip=current_node.ip_address,
+                destination_ip=opp_packet.source_ip,
+                distance=distance_back_to_source,
+                visited_nodes_bloom_filter=None, # Pass None, not used
+                original_opp_destination_ip=opp_packet.destination_ip
             )
             current_node.send_distance_update(update_pkt)
-            # ------------------------------------------------------------------------------------------
 
-            # --- Online TGNN reward: positive reward for delivery ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, 2.0, None, True  # Stronger reward for delivery
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
             return True # Packet delivered
 
         # 2. Check if TTL expired
         if opp_packet.ttl <= 0:
             Node.drop_count += 1
-            # --- Online TGNN reward: negative reward for drop ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, -2.0, None, True  # Stronger penalty for drop
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
-            return False # Packet dropped
-
-        # 3. Gather neighbor info for GNN input
-        self.gnn_agent.update_neighbors()
-        dst_node = next((n for n in config.nodes if n.ip_address == opp_packet.destination_ip), None)
-        if not self.gnn_agent.neighbors or dst_node is None:
-            Node.drop_count += 1
-            return False
-
-        # Only consider neighbors that make progress toward the destination
-        next_node = self.gnn_agent.select_best_forwarder(dst_node)
-        if next_node and next_node.energy > 0 and self.energy > 0:
-            self.energy = max(0, self.energy - 0.0003)
-            next_node.energy = max(0, next_node.energy - 0.0001)
-            next_node.opp_packet_queue.append(opp_packet)
-            # Optionally: online GNN update (reward = 1 for delivery, 0 for not delivered)
-            # Feedback can be shaped as in reference if desired
-            return True
-        else:
-            Node.drop_count += 1
-            return False
-
-# === Bloom Filter Implementation ===
-class BloomFilter:
-    def __init__(self, capacity, error_rate):
-        self.capacity = capacity
-        self.error_rate = error_rate
-
-        m_optimal = int(-(capacity * math.log(error_rate)) / (math.log(2)**2))
-        k_optimal = int((m_optimal / capacity) * math.log(2))
-
-        self.m = min(max(m_optimal, 256), 1024) # Increase bit array for lower false positive
-        self.k = max(4, int((self.m / capacity) * math.log(2))) # Increase hash functions
-
-        self.m = (self.m + 7) // 8 * 8
-        self.bit_array = bytearray(self.m // 8)
-
-    def _hash(self, element, seed):
-        """Compute a hash value for the element using MurmurHash3."""
-        # Using MurmurHash3 because it's fast and has good distribution
-        # Ensure element is hashable (e.g., convert to string)
-        return mmh3.hash(str(element), seed) % self.m
-
-    def add(self, element):
-        """Add an element to the bloom filter."""
-        for i in range(self.k):
-            index = self._hash(element, i)
-            byte_index = index // 8
-            bit_offset = index % 8
-            self.bit_array[byte_index] |= (1 << bit_offset)
-
-    def might_contain(self, element):
-        """Check if an element might be in the bloom filter."""
-        for i in range(self.k):
-            index = self._hash(element, i)
-            byte_index = index // 8
-            bit_offset = index % 8
-            if not (self.bit_array[byte_index] & (1 << bit_offset)):
-                return False # Definitely not in the set
-        return True # Possibly in the set (could be a false positive)
-
-# === Packet Classes ===
-class OppPacket:
-    def __init__(self, source_ip, destination_ip, ttl, source_mac_address, source_x, source_y, source_z): # Added source_mac_address and position
-        self.source_ip = source_ip # Original source IP
-        self.destination_ip = destination_ip
-        self.ttl = ttl
-        # Add creation timestamp
-        self.creation_timestamp = datetime.now()
-        self.visited_nodes = BloomFilter(capacity=100, error_rate=0.01)
-        self.initial_ttl = ttl # Store initial TTL for analysis
-        self.delivered = False # Track if the packet has been delivered
-        self.current_hop_mac = source_mac_address # Store the MAC of the current node holding/forwarding the packet
-        self.source_x = source_x
-        self.source_y = source_y
-        self.source_z = source_z
-
-
-class HelloPacket:
-    def __init__(self, source_ip, source_mac, x, y, z, timestamp, distance, node):
-        self.source_ip = source_ip
-        self.source_mac = source_mac
-        self.x = x
-        self.y = y
-        self.z = z
-        self.timestamp = timestamp
-        self.distance = distance
-        self.node = node
-
-    def __repr__(self):
-        return f"HelloPacket(src_ip={self.source_ip}, distance={self.distance:.2f}, time={self.timestamp}, node_id={self.node.node_id})"
-
-class DistanceUpdatePacket:
-    def __init__(self, source_ip, destination_ip, distance, visited_nodes_bloom_filter, original_opp_destination_ip):
-        self.source_ip = source_ip # The node sending the update (likely the destination or an intermediate node)
-        self.destination_ip = destination_ip # The original source node of the OppPacket
-        self.distance = distance # The distance from the source_ip of this update packet to the original destination
-        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        self.visited_nodes = visited_nodes_bloom_filter # Carry the bloom filter for the RETURN path
-        self.original_opp_destination_ip = original_opp_destination_ip # Add original destination IP
-        self.ttl = 50 # Add TTL for distance update packets (arbitrary initial value)
-
-
-# === Node Class ===
-class Node:
-    packet_sent_count = 0
-    packet_delivered_count = 0
-    drop_count = 0
-    delivered_packets = [] # List to store info about delivered packets
-    # Add lists to store packet and visited_nodes sizes for delivered packets
-    delivered_packet_sizes = []
-    delivered_visited_nodes_sizes = []
-
-
-    def __init__(self, ip_address, mac_address, x, y, z, node_id):
-        self.mac_address = mac_address
-        self.node_id = self.generate_unique_node_id()
-        self.ip_address = ip_address
-        self.x = x
-        self.y = y
-        self.z = z
-        self.queue = defaultdict(lambda: deque(maxlen=5))
-        self.opp_packet_queue = deque(maxlen=500)  # Increased queue size for opportunistic packets
-        self.distance_update_queue = deque()
-        self.position = np.array([{
-            'x': x, 'y': y, 'z': z,
-            'Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }])
-        self.known_destinations = {}
-        self.energy = 100.0
-        self.reward_by_direction = defaultdict(list)
-        self.success_by_direction = defaultdict(lambda: {"success": 0, "total": 0})
-        self.opp_dest_packet = []
-        self.packets = np.array([])
-        if not hasattr(Node, 'tgnn_model'):
-            Node.tgnn_model = CustomOnlineTGNN()
-        self.last_tgnn_state = None
-        self.last_tgnn_action = None
-        # Remove offline_forward_model attribute
-        # if not hasattr(Node, 'offline_forward_model'):
-        #     Node.offline_forward_model = None
-        self.gnn_agent = None  # Will be set after all nodes are created
-
-    def generate_unique_node_id(self):
-        """Generates a unique 16-bit node ID using CRC32 of MAC and a random salt."""
-        salt = random.getrandbits(32) # Generate a random 32-bit salt
-        data = f"{self.mac_address}{salt}".encode('utf-8')
-        crc32 = zlib.crc32(data) # Calculate CRC32
-        return crc32 % 1000 # Ensure the ID is within the range [0, 999], suitable for Bloom filter capacity
-
-
-    def hello(self, time, distance, node):
-        """Creates a Hello packet."""
-        pkt = {
-            'source_ip': self.ip_address,
-            'source_mac': self.mac_address,
-            'x': self.x,
-            'y': self.y,
-            'z': self.z,
-            'timestamp': time,
-            'distance': distance,
-            'node': self # Include the node object itself
-        }
-        # Create a dynamic object with attributes from the dictionary
-        return type('HelloPacket', (object,), pkt)()
-
-    def sort_mobility(self):
-        """Sorts the position log by time."""
-        self.position = np.array(sorted(
-            self.position,
-            key=lambda p: datetime.strptime(p['Time'], "%Y-%m-%d %H:%M:%S")
-        ))
-
-    def update_position_log(self):
-        """Logs the current position and timestamp."""
-        self.position = np.append(
-            self.position,
-            {
-                'x': self.x,
-                'y': self.y,
-                'z': self.z,
-                'Time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        )
-
-    def distance_to(self, other_node):
-        """Calculates the Euclidean distance to another node."""
-        return math.sqrt((self.x - other_node.x)**2 + (self.y - other_node.y)**2 + (self.z - other_node.z)**2)
-
-    def recent_distance(self, x, y, z):
-        """Calculates the distance to a given coordinate."""
-        return math.sqrt((self.x - x)**2 + (self.y - y)**2 + (self.z - z)**2)
-
-    def node_direction(self, pkts):
-        """Determines the direction of movement based on recent hello packets."""
-        # Check if there are at least two packets before accessing indices
-        if len(pkts) < 2:
-            return 0  # Return a default direction (e.g., stationary) if not enough data
-        return +1 if pkts[1].distance < pkts[0].distance else -1 # +1 if getting closer, -1 if moving away
-
-    def relative_speed(self, pkts):
-        """Calculates the relative speed to a neighbor."""
-        # Check if there are at least two packets before accessing indices
-        if len(pkts) < 2:
-            return 0.0 # Return a default speed (0) if not enough data
-        t1 = pd.to_datetime(pkts[0].timestamp)
-        t2 = pd.to_datetime(pkts[1].timestamp)
-        d1 = pkts[0].distance
-        d2 = pkts[1].distance
-        time_diff = (t2 - t1).total_seconds()
-        return abs(d2 - d1) / time_diff if time_diff != 0 else 0
-
-    def clean_stale_hello_packets(self, max_age_sec=20):
-        """Removes stale hello packets from the queue."""
-        now = pd.to_datetime(datetime.now())
-        for neighbor_ip in list(self.queue.keys()):
-            self.queue[neighbor_ip] = deque(
-                [pkt for pkt in self.queue[neighbor_ip] if hasattr(pkt, 'timestamp') and (now - pd.to_datetime(pkt.timestamp)).total_seconds() <= max_age_sec],
-                maxlen=5
-            )
-
-    def receive_hello_packet(self, hello_pkt):
-        """Processes a received hello packet."""
-        peer_ip = hello_pkt.source_ip
-        self.queue[peer_ip].append(hello_pkt)
-        # Update known distance if the hello packet is from a known destination
-        if hello_pkt.source_ip in self.known_destinations:
-            self.known_destinations[hello_pkt.source_ip] = hello_pkt.distance
-
-    def send_distance_update(self, update_packet):
-        """Sends a distance update packet (adds to queue for processing)."""
-        # For simplicity, just add to the queue for now.
-        # Actual routing back to source would be more complex in a real network.
-        self.distance_update_queue.append(update_packet)
-
-    def process_distance_updates(self):
-        """Processes received distance update packets."""
-        processed_updates = []
-        while self.distance_update_queue:
-            update_packet = self.distance_update_queue.popleft()
-
-            # Decrement TTL of the distance update packet
-            update_packet.ttl -= 1
-            if update_packet.ttl <= 0:
-                # Drop distance update packet if TTL expired
-                continue
-
-            # If this node is the original source of the packet that triggered this update
-            if update_packet.destination_ip == self.ip_address:
-                self.known_destinations[update_packet.original_opp_destination_ip] = update_packet.distance
-
-            else:
-                # --- Step 5: Intermediate node attempts to forward the distance update packet ---
-                # This is an intermediate node receiving an update packet meant for the original source.
-                # This node needs to attempt to forward the update packet towards update_packet.destination_ip
-                # (the original source).
-
-                # Find potential forwarders for the distance update packet (towards the original source)
-                # Prioritize neighbors closer to the original source
-                original_source_node = next((n for n in config.nodes if n.ip_address == update_packet.destination_ip), None)
-                if original_source_node:
-                    forwarder_candidates = [
-                        pkt.node for neighbor_ip, pkts in self.queue.items() for pkt in pkts
-                        if self.distance_to(pkt.node) <= 250
-                        and self.energy > 1
-                        and pkt.node.distance_to(original_source_node) < self.distance_to(original_source_node)
-                    ]
-
-                    if forwarder_candidates:
-                        # Select the best forwarder (e.g., the one closest to the original source)
-                        next_hop_for_update = min(
-                            forwarder_candidates,
-                            key=lambda node: node.distance_to(original_source_node)
-                        )
-                        # Attempt to forward the update packet to the next hop
-                        # In a real simulation, this would involve adding to the next hop's queue
-                        next_hop_for_update.distance_update_queue.append(update_packet)
-                    else:
-                        # No suitable forwarder found, the update packet might be dropped or re-queued
-                        # For now, let's re-queue it, hoping for better opportunities later
-                         processed_updates.append(update_packet) # Re-queue if not forwarded
-                         # print(f"Node {self.node_id} could not forward DistanceUpdate towards {original_source_node.node_id}, re-queuing.")
-                else:
-                    # Original source node not found in config.nodes (shouldn't happen in this simulation)
-                    # Drop the update packet
-                    # print(f"Node {self.node_id} received DistanceUpdate for unknown source {update_packet.destination_ip}, dropping.")
-                    pass
-                # ------------------------------------------------------------------------------------------
-
-        self.distance_update_queue.extend(processed_updates) # Add updates back that weren't processed/dropped
-
-
-    def send_packet(self, destination_ip):
-        """Creates and queues an opportunistic packet for sending with adaptive TTL."""
-        destination_node = next((n for n in config.nodes if n.ip_address == destination_ip), None)
-        if destination_node:
-            # --- Adaptive TTL based on neighbor count and TGNN suggestion ---
-            neighbor_count = sum(1 for pkts in self.queue.values() for _ in pkts)
-            base_distance = self.distance_to(destination_node)
-            # Prepare dummy features for TTL prediction
-            nodes_features = [
-                [self.node_id, self.x, self.y, self.z, self.energy, 1.0, 0, 0, 0, self.energy, 0, base_distance]
-            ]
-            edge_index = []
-            edge_attr = []
-            idx = 1
-            for neighbor_ip, pkts in self.queue.items():
-                for pkt in pkts:
-                    neighbor = pkt.node
-                    nodes_features.append([
-                        neighbor.node_id, neighbor.x, neighbor.y, neighbor.z, neighbor.energy, 0.0, 0, 0, 0, neighbor.energy, 0, neighbor.distance_to(destination_node)
-                    ])
-                    edge_index.append([0, idx])
-                    # Use dummy edge features for TTL prediction
-                    edge_attr.append([0.0, 0.0, 0.0])
-                    idx += 1
-            # Use TGNN to predict TTL if enough neighbors, else fallback
-            if len(nodes_features) > 1:
-                tgnn_ttl = Node.tgnn_model.predict_ttl(nodes_features, edge_index, edge_attr)
-                ttl = int(min(300, max(30, tgnn_ttl)))
-            else:
-                # Fallback: density-based TTL
-                ttl = int(min(300, max(30, base_distance / 5 + neighbor_count * 2)))
-            packet = self.create_packet(destination_ip, ttl, self.mac_address, self.x, self.y, self.z)
-            if packet:
-                Node.packet_sent_count += 1
-                self.opp_packet_queue.append(packet)
-                return True
-        return False
-
-    def create_packet(self, destination_ip, ttl, source_mac_address, source_x, source_y, source_z): # Added source_mac_address and position
-        """Creates an OppPacket instance."""
-        packet = OppPacket(
-            source_ip=self.ip_address,
-            destination_ip=destination_ip,
-            ttl=ttl,
-            source_mac_address=source_mac_address, # Pass the source MAC
-            source_x=source_x,
-            source_y=source_y,
-            source_z=source_z
-        )
-        # Explicitly set the creation_timestamp when the packet is created
-        packet.creation_timestamp = datetime.now()
-        # visited_nodes and other attributes are initialized in OppPacket.__init__
-        return packet
-
-    def process_queue(self):
-        """Processes packets in the opportunistic packet queue using TGNN for forwarding."""
-        processed_packets = []
-        for _ in range(len(self.opp_packet_queue)):
-            packet = self.opp_packet_queue.popleft()
-            if packet.delivered:
-                continue
-            if packet.ttl <= 0:
-                if not packet.delivered:
-                    Node.drop_count += 1
-                continue
-            success = self.tgnn_forward(packet)
-            if not success:
-                packet.ttl -= 1
-                if packet.ttl > 0:
-                    processed_packets.append(packet)
-                else:
-                    if not packet.delivered:
-                        Node.drop_count += 1
-        self.opp_packet_queue.extend(processed_packets)
-
-    def tgnn_forward(self, opp_packet):
-        """Uses GNN-based neighbor scoring for next-hop selection (progress-only)."""
-        current_node = self
-        opp_packet.visited_nodes.add(current_node.mac_address)
-        opp_packet.current_hop_mac = current_node.mac_address
-
-        # 1. Check if destination
-        if current_node.ip_address == opp_packet.destination_ip:
-            if hasattr(opp_packet, "delivered") and opp_packet.delivered:
-                return True
-            opp_packet.delivered = True
-            Node.packet_delivered_count += 1
-            print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {datetime.now()}")
-
-            # Collect visited_nodes size at destination
-            visited_nodes_size = 0
-            if hasattr(opp_packet, 'visited_nodes') and isinstance(opp_packet.visited_nodes, BloomFilter):
-                 visited_nodes_size = sys.getsizeof(opp_packet.visited_nodes.bit_array) + sys.getsizeof(opp_packet.visited_nodes)
-
-            # Log delivered packet info
-            Node.delivered_packets.append({
-                'initial_ttl': opp_packet.initial_ttl,
-                'final_ttl': opp_packet.ttl,
-                'hops_used': opp_packet.initial_ttl - opp_packet.ttl,
-                'creation_timestamp': opp_packet.creation_timestamp, # Log creation timestamp
-                'delivery_timestamp': datetime.now(), # Log delivery timestamp
-                'visited_nodes_size': visited_nodes_size # Include visited nodes size
-            })
-
-            # Collect packet size at destination (Python object size)
-            packet_size = sys.getsizeof(opp_packet) + sum(sys.getsizeof(attr_value) for attr_value in opp_packet.__dict__.values())
-            Node.delivered_packet_sizes.append(packet_size)
-            # Collect visited_nodes size at destination (Python object size)
-            Node.delivered_visited_nodes_sizes.append(visited_nodes_size)
-
-
-            current_node.opp_dest_packet.append(opp_packet) # Store delivered packet at destination
-            current_node.packets = np.append(current_node.packets, opp_packet) # Still keep in packets for history
-
-
-            # --- Step 3: Create and send distance update back to source using a NEW bloom filter ---
-            # Calculate distance back to source using position from OppPacket
-            distance_back_to_source = math.sqrt(
-                (current_node.x - opp_packet.source_x)**2 +
-                (current_node.y - opp_packet.source_y)**2 +
-                (current_node.z - opp_packet.source_z)**2
-            )
-
-            # Create a NEW bloom filter for the distance update packet's return journey
-            update_bloom_filter = BloomFilter(capacity=100, error_rate=0.01)
-            # Add the current node (destination) to the update packet's bloom filter
-            update_bloom_filter.add(current_node.mac_address)
-
-
-            update_pkt = DistanceUpdatePacket(
-                source_ip=current_node.ip_address, # Destination is the source of the update
-                destination_ip=opp_packet.source_ip, # Send back to original source
-                distance=distance_back_to_source, # Use calculated distance back to source
-                visited_nodes_bloom_filter=update_bloom_filter, # Include the NEW visited nodes bloom filter for the return path
-                original_opp_destination_ip=opp_packet.destination_ip # Include original destination IP
-            )
-            current_node.send_distance_update(update_pkt)
-            # ------------------------------------------------------------------------------------------
-
-            # --- Online TGNN reward: positive reward for delivery ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, 2.0, None, True  # Stronger reward for delivery
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
-            return True # Packet delivered
-
-        # 2. Check if TTL expired
-        if opp_packet.ttl <= 0:
-            Node.drop_count += 1
-            # --- Online TGNN reward: negative reward for drop ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, -2.0, None, True  # Stronger penalty for drop
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
             return False # Packet dropped
 
         # 3. Gather neighbor info for GNN input
@@ -1163,7 +638,7 @@ class Node:
     delivered_packets = [] # List to store info about delivered packets
     # Add lists to store packet and visited_nodes sizes for delivered packets
     delivered_packet_sizes = []
-    delivered_visited_nodes_sizes = []
+    delivered_visited_nodes_sizes = [] # Will be unused, can be removed
 
 
     def __init__(self, ip_address, mac_address, x, y, z, node_id):
@@ -1348,9 +823,12 @@ class Node:
         """Creates and queues an opportunistic packet for sending with adaptive TTL."""
         destination_node = next((n for n in config.nodes if n.ip_address == destination_ip), None)
         if destination_node:
+            # Only send if distance to destination is greater than 250 meters
+            base_distance = self.distance_to(destination_node)
+            if base_distance <= 250:
+                return False
             # --- Adaptive TTL based on neighbor count and TGNN suggestion ---
             neighbor_count = sum(1 for pkts in self.queue.values() for _ in pkts)
-            base_distance = self.distance_to(destination_node)
             # Prepare dummy features for TTL prediction
             nodes_features = [
                 [self.node_id, self.x, self.y, self.z, self.energy, 1.0, 0, 0, 0, self.energy, 0, base_distance]
@@ -1422,7 +900,6 @@ class Node:
     def tgnn_forward(self, opp_packet):
         """Uses GNN-based neighbor scoring for next-hop selection (progress-only)."""
         current_node = self
-        opp_packet.visited_nodes.add(current_node.mac_address)
         opp_packet.current_hop_mac = current_node.mac_address
 
         # 1. Check if destination
@@ -1433,75 +910,41 @@ class Node:
             Node.packet_delivered_count += 1
             print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {datetime.now()}")
 
-            # Collect visited_nodes size at destination
-            visited_nodes_size = 0
-            if hasattr(opp_packet, 'visited_nodes') and isinstance(opp_packet.visited_nodes, BloomFilter):
-                 visited_nodes_size = sys.getsizeof(opp_packet.visited_nodes.bit_array) + sys.getsizeof(opp_packet.visited_nodes)
-
-            # Log delivered packet info
             Node.delivered_packets.append({
                 'initial_ttl': opp_packet.initial_ttl,
                 'final_ttl': opp_packet.ttl,
                 'hops_used': opp_packet.initial_ttl - opp_packet.ttl,
-                'creation_timestamp': opp_packet.creation_timestamp, # Log creation timestamp
-                'delivery_timestamp': datetime.now(), # Log delivery timestamp
-                'visited_nodes_size': visited_nodes_size # Include visited nodes size
+                'creation_timestamp': opp_packet.creation_timestamp,
+                'delivery_timestamp': datetime.now()
             })
 
-            # Collect packet size at destination (Python object size)
             packet_size = sys.getsizeof(opp_packet) + sum(sys.getsizeof(attr_value) for attr_value in opp_packet.__dict__.values())
             Node.delivered_packet_sizes.append(packet_size)
-            # Collect visited_nodes size at destination (Python object size)
-            Node.delivered_visited_nodes_sizes.append(visited_nodes_size)
 
+            current_node.opp_dest_packet.append(opp_packet)
+            current_node.packets = np.append(current_node.packets, opp_packet)
 
-            current_node.opp_dest_packet.append(opp_packet) # Store delivered packet at destination
-            current_node.packets = np.append(current_node.packets, opp_packet) # Still keep in packets for history
-
-
-            # --- Step 3: Create and send distance update back to source using a NEW bloom filter ---
-            # Calculate distance back to source using position from OppPacket
+            # --- Step 3: Create and send distance update back to source ---
             distance_back_to_source = math.sqrt(
                 (current_node.x - opp_packet.source_x)**2 +
                 (current_node.y - opp_packet.source_y)**2 +
                 (current_node.z - opp_packet.source_z)**2
             )
 
-            # Create a NEW bloom filter for the distance update packet's return journey
-            update_bloom_filter = BloomFilter(capacity=100, error_rate=0.01)
-            # Add the current node (destination) to the update packet's bloom filter
-            update_bloom_filter.add(current_node.mac_address)
-
-
             update_pkt = DistanceUpdatePacket(
-                source_ip=current_node.ip_address, # Destination is the source of the update
-                destination_ip=opp_packet.source_ip, # Send back to original source
-                distance=distance_back_to_source, # Use calculated distance back to source
-                visited_nodes_bloom_filter=update_bloom_filter, # Include the NEW visited nodes bloom filter for the return path
-                original_opp_destination_ip=opp_packet.destination_ip # Include original destination IP
+                source_ip=current_node.ip_address,
+                destination_ip=opp_packet.source_ip,
+                distance=distance_back_to_source,
+                visited_nodes_bloom_filter=None, # Pass None, not used
+                original_opp_destination_ip=opp_packet.destination_ip
             )
             current_node.send_distance_update(update_pkt)
-            # ------------------------------------------------------------------------------------------
 
-            # --- Online TGNN reward: positive reward for delivery ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, 2.0, None, True  # Stronger reward for delivery
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
             return True # Packet delivered
 
         # 2. Check if TTL expired
         if opp_packet.ttl <= 0:
             Node.drop_count += 1
-            # --- Online TGNN reward: negative reward for drop ---
-            if self.last_tgnn_state is not None and self.last_tgnn_action is not None:
-                Node.tgnn_model.store_experience(
-                    self.last_tgnn_state, self.last_tgnn_action, -2.0, None, True  # Stronger penalty for drop
-                )
-                self.last_tgnn_state = None
-                self.last_tgnn_action = None
             return False # Packet dropped
 
         # 3. Gather neighbor info for GNN input
@@ -1627,305 +1070,324 @@ class Opportunistic:
                             node_j.receive_hello_packet(hello_pkt_j)
 
 
-# Define the node count to simulate
-num_nodes_sim = 100
-
-# Define the speeds to simulate
-# speeds_to_simulate = [40]  # Increased speed for better performance
+# Define the node counts and speeds to simulate
+num_nodes_list = list(range(100, 600, 100))  # 100, 200, 300, 400, 500
 speeds_to_simulate = list(range(20, 41, 5))  # 20, 25, 30, 35, 40
 
-# Initialize dictionaries to store results for each speed
+# Initialize dictionaries to store results for each (num_nodes, speed) pair
 pdr_results = {}
-e2e_delay_stats_results = {} # Store describe() output
+e2e_delay_stats_results = {}
 throughput_results = {}
 avg_reward_results = {}
 avg_success_rate_results = {}
-avg_on_bits_stats_results = {} # Store describe() output
+avg_on_bits_stats_results = {}
 min_energy_results = {}
 max_hops_results = {}
 avg_initial_ttl_results = {}
 avg_final_ttl_results = {}
 simulation_duration_results = {}
 
+# Path for the CSV file to store results
+csv_results_path = "simulation_results.csv"
 
-for speed_sim in speeds_to_simulate:
-    print(f"\n--- Running Simulation with {num_nodes_sim} Nodes at Speed {speed_sim} m/s ---")
+# Write CSV header if file does not exist or is empty
+if not os.path.exists(csv_results_path) or os.path.getsize(csv_results_path) == 0:
+    with open(csv_results_path, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([
+            "Num Nodes", "Speed (m/s)", "Src-Dst Distance (m)", "PDR (%)", "E2E Delay Mean (s)", "E2E Delay Median (s)", "E2E Delay Std (s)",
+            "E2E Delay Min (s)", "E2E Delay Max (s)", "Estimated Throughput (bps)",
+            "Avg Reward Closer (+1)", "Avg Reward Stationary (0)", "Avg Reward Away (-1)",
+            "Avg Success Rate Closer (+1)", "Avg Success Rate Stationary (0)", "Avg Success Rate Away (-1)",
+            "Min Remaining Energy (%)", "Max Hops Used", "Avg Initial TTL", "Avg Final TTL", "Simulation Duration (s)"
+        ])
 
-    # Reset static counters and lists for metrics
-    Node.packet_sent_count = 0
-    Node.packet_delivered_count = 0
-    Node.drop_count = 0
-    Node.delivered_packets = []
-    Node.delivered_packet_sizes = []
-    Node.delivered_visited_nodes_sizes = []
+for num_nodes_sim in num_nodes_list:
+    for speed_sim in speeds_to_simulate:
+        print(f"\n--- Running Simulation with {num_nodes_sim} Nodes at Speed {speed_sim} m/s ---")
 
-    # Setup network - pass num_nodes_sim to Configure
-    config = Configure(num_nodes=num_nodes_sim)
-    opportunistic = Opportunistic(config)
-    # Set speed range
-    mobility = MobilityModel(config, space_dim=1000, speed_range=(speed_sim, speed_sim))
+        # Reset static counters and lists for metrics
+        Node.packet_sent_count = 0
+        Node.packet_delivered_count = 0
+        Node.drop_count = 0
+        Node.delivered_packets = []
+        Node.delivered_packet_sizes = []
+        Node.delivered_visited_nodes_sizes = []
+
+        # Setup network - pass num_nodes_sim to Configure
+        config = Configure(num_nodes=num_nodes_sim)
+        opportunistic = Opportunistic(config)
+        mobility = MobilityModel(config, space_dim=1000, speed_range=(speed_sim, speed_sim))
+
+        # --- Select source and destination nodes with distance > 250m ---
+        # Try all pairs until a valid pair is found
+        found_pair = False
+        for i in range(len(config.nodes)):
+            for j in range(len(config.nodes)):
+                if i == j:
+                    continue
+                src_candidate = config.nodes[i]
+                dst_candidate = config.nodes[j]
+                dist = src_candidate.distance_to(dst_candidate)
+                if dist > 250:
+                    source = src_candidate
+                    destination = dst_candidate
+                    src_dst_distance = dist
+                    found_pair = True
+                    break
+            if found_pair:
+                break
+        if not found_pair:
+            print("Warning: Could not find a source-destination pair with distance > 250m. Skipping this simulation.")
+            continue
+
+        # Define packet transmission configuration
+        total_packets_to_send = 100 # Send only 300 packets
+        packets_per_second = 20 # Increased packet sending rate
+        sent_packet_count = 0
+        simulation_steps = math.ceil(total_packets_to_send / packets_per_second) + 50  # more extra steps for late deliveries
 
 
-    # Define source and destination nodes
-    source = config.nodes[0]
-    # Adjust the destination node index
-    destination = config.nodes[num_nodes_sim - 1]
+        # --- Simulation Loop ---
+        start_time = time.time()
+        for timestep in range(simulation_steps):
+            # print(f"--- Time step {timestep} ---") # Suppress detailed timestep logging
+
+            # 1. Update node positions
+            mobility.update_positions()
+
+            # 2. Discover neighbors (Hello packets exchanged)
+            opportunistic.forwarder()
+
+            # 3. Send packets this step (if not all sent)
+            if sent_packet_count < total_packets_to_send:
+                packets_this_step = min(packets_per_second, total_packets_to_send - sent_packet_count)
+                for _ in range(packets_this_step):
+                    source.send_packet(destination.ip_address)
+                sent_packet_count += packets_this_step
+
+            # 4. Node updates: position logging, queue processing, and distance update processing
+            for node in config.nodes:
+                node.update_position_log()
+                node.process_queue() # Process OppPackets
+                node.process_distance_updates() # Process DistanceUpdatePackets
+
+            # Optional: simulate real time
+            # time.sleep(0.01)
+
+            # Log intermediate results every 20 steps
+            if timestep % 20 == 0 or timestep == simulation_steps - 1:
+                total_sent = Node.packet_sent_count
+                total_delivered = Node.packet_delivered_count
+                total_dropped = Node.drop_count
+                pdr = (total_delivered / total_sent) * 100 if total_sent > 0 else 0.0
+                print(f"[Step {timestep}] Sent: {total_sent}, Delivered: {total_delivered}, Dropped: {total_dropped}, PDR: {pdr:.2f}%")
+
+        end_time = time.time()
+        simulation_duration = end_time - start_time
+        simulation_duration_results[(num_nodes_sim, speed_sim)] = simulation_duration
+        print(f"Simulation with {num_nodes_sim} nodes at speed {speed_sim} m/s finished in {simulation_duration:.2f} seconds.")
+
+        # --- Calculate Performance Metrics ---
+
+        # PDR
+        total_packets_sent = Node.packet_sent_count
+        total_packets_delivered = Node.packet_delivered_count
+        pdr = (total_packets_delivered / total_packets_sent) * 100 if total_packets_sent > 0 else 0.0
+        pdr_results[(num_nodes_sim, speed_sim)] = pdr
+        print(f"  PDR: {pdr:.2f}%")
 
 
-    # Define packet transmission configuration
-    total_packets_to_send = 100 # Send only 300 packets
-    packets_per_second = 20 # Increased packet sending rate
-    sent_packet_count = 0
-    simulation_steps = math.ceil(total_packets_to_send / packets_per_second) + 50  # more extra steps for late deliveries
+        # End-to-End Delay
+        end_to_end_delays = []
+        if Node.delivered_packets:
+            for packet_info in Node.delivered_packets:
+                if 'creation_timestamp' in packet_info and 'delivery_timestamp' in packet_info:
+                    creation_time = packet_info['creation_timestamp']
+                    delivery_time = packet_info['delivery_timestamp']
+                    delay = (delivery_time - creation_time).total_seconds()
+                    end_to_end_delays.append(delay)
+        if end_to_end_delays:
+            e2e_delay_stats = pd.Series(end_to_end_delays).describe()
+            e2e_delay_stats_results[(num_nodes_sim, speed_sim)] = e2e_delay_stats
+            print(f"  Avg E2E Delay: {e2e_delay_stats['mean']:.2f} seconds")
+        else:
+            e2e_delay_stats_results[(num_nodes_sim, speed_sim)] = None
+            print("  Avg E2E Delay: N/A (no delivered packets)")
 
 
-    # --- Simulation Loop ---
-    start_time = time.time()
-    for timestep in range(simulation_steps):
-        # print(f"--- Time step {timestep} ---") # Suppress detailed timestep logging
+        # Estimated Throughput
+        estimated_average_packet_size_bytes = 0
+        if Node.delivered_packet_sizes:
+            estimated_average_packet_size_bytes = np.mean(Node.delivered_packet_sizes)
 
-        # 1. Update node positions
-        mobility.update_positions()
+        throughput_bps = 0
+        if total_packets_delivered > 0 and simulation_duration > 0 and estimated_average_packet_size_bytes > 0:
+            total_data_delivered_bytes = total_packets_delivered * estimated_average_packet_size_bytes
+            total_data_delivered_bits = total_data_delivered_bytes * 8
+            throughput_bps = total_data_delivered_bits / simulation_duration
 
-        # 2. Discover neighbors (Hello packets exchanged)
-        opportunistic.forwarder()
+        throughput_results[(num_nodes_sim, speed_sim)] = throughput_bps
+        print(f"  Estimated Throughput: {throughput_bps / 1000:.2f} Kbps")
 
-        # 3. Send packets this step (if not all sent)
-        if sent_packet_count < total_packets_to_send:
-            packets_this_step = min(packets_per_second, total_packets_to_send - sent_packet_count)
-            for _ in range(packets_this_step):
-                source.send_packet(destination.ip_address)
-            sent_packet_count += packets_this_step
 
-        # 4. Node updates: position logging, queue processing, and distance update processing
+        # Direction-Based Analysis (Aggregate from all nodes)
+        total_reward_by_direction = defaultdict(list)
+        success_rate_by_direction = defaultdict(list)
+
         for node in config.nodes:
-            node.update_position_log()
-            node.process_queue() # Process OppPackets
-            node.process_distance_updates() # Process DistanceUpdatePackets
+            for direction, rewards in node.reward_by_direction.items():
+                if direction != -99:
+                    total_reward_by_direction[direction].extend(rewards)
 
-        # Optional: simulate real time
-        # time.sleep(0.01)
+            for direction, outcome in node.success_by_direction.items():
+                 if direction != -99 and outcome["total"] > 0:
+                    success_rate = outcome["success"] / outcome["total"]
+                    success_rate_by_direction[direction].append(success_rate)
+                 elif direction != -99 and outcome["total"] == 0:
+                     success_rate_by_direction[direction].append(0)
 
-        # Log intermediate results every 20 steps
-        if timestep % 20 == 0 or timestep == simulation_steps - 1:
-            total_sent = Node.packet_sent_count
-            total_delivered = Node.packet_delivered_count
-            total_dropped = Node.drop_count
-            pdr = (total_delivered / total_sent) * 100 if total_sent > 0 else 0.0
-            print(f"[Step {timestep}] Sent: {total_sent}, Delivered: {total_delivered}, Dropped: {total_dropped}, PDR: {pdr:.2f}%")
+        # Calculate averages here
+        avg_reward_by_direction = {d: np.mean(r) for d, r in total_reward_by_direction.items() if r}
+        avg_success_rate_by_direction = {d: np.mean(rates) for d, rates in success_rate_by_direction.items() if rates}
 
-    end_time = time.time()
-    simulation_duration = end_time - start_time
-    simulation_duration_results[speed_sim] = simulation_duration
-    print(f"Simulation with {num_nodes_sim} nodes at speed {speed_sim} m/s finished in {simulation_duration:.2f} seconds.")
-
-    # --- Calculate Performance Metrics ---
-
-    # PDR
-    total_packets_sent = Node.packet_sent_count
-    total_packets_delivered = Node.packet_delivered_count
-    pdr = (total_packets_delivered / total_packets_sent) * 100 if total_packets_sent > 0 else 0.0
-    pdr_results[speed_sim] = pdr
-    print(f"  PDR: {pdr:.2f}%")
+        avg_reward_results[(num_nodes_sim, speed_sim)] = avg_reward_by_direction
+        avg_success_rate_results[(num_nodes_sim, speed_sim)] = avg_success_rate_by_direction
+        print(f"  Avg Reward by Direction: {avg_reward_by_direction}")
+        print(f"  Avg Success Rate by Direction: {avg_success_rate_by_direction}")
 
 
-    # End-to-End Delay
-    end_to_end_delays = []
-    if Node.delivered_packets:
-        for packet_info in Node.delivered_packets:
-            if 'creation_timestamp' in packet_info and 'delivery_timestamp' in packet_info:
-                creation_time = packet_info['creation_timestamp']
-                delivery_time = packet_info['delivery_timestamp']
-                delay = (delivery_time - creation_time).total_seconds()
-                end_to_end_delays.append(delay)
-    if end_to_end_delays:
-        e2e_delay_stats = pd.Series(end_to_end_delays).describe()
-        e2e_delay_stats_results[speed_sim] = e2e_delay_stats
-        print(f"  Avg E2E Delay: {e2e_delay_stats['mean']:.2f} seconds")
-    else:
-        e2e_delay_stats_results[speed_sim] = None
-        print("  Avg E2E Delay: N/A (no delivered packets)")
+        # Minimum Remaining Energy
+        energies = [node.energy for node in config.nodes]
+        min_energy = min(energies) if energies else 0
+        min_energy_results[(num_nodes_sim, speed_sim)] = min_energy
+        print(f"  Minimum Remaining Energy: {min_energy:.2f}%")
 
 
-    # Estimated Throughput
-    estimated_average_packet_size_bytes = 0
-    if Node.delivered_packet_sizes:
-        estimated_average_packet_size_bytes = np.mean(Node.delivered_packet_sizes)
-
-    throughput_bps = 0
-    if total_packets_delivered > 0 and simulation_duration > 0 and estimated_average_packet_size_bytes > 0:
-        total_data_delivered_bytes = total_packets_delivered * estimated_average_packet_size_bytes
-        total_data_delivered_bits = total_data_delivered_bytes * 8
-        throughput_bps = total_data_delivered_bits / simulation_duration
-
-    throughput_results[speed_sim] = throughput_bps
-    print(f"  Estimated Throughput: {throughput_bps / 1000:.2f} Kbps")
+        # Maximum Hops Used
+        max_hops = 0
+        if Node.delivered_packets:
+             hops_used = [p['hops_used'] for p in Node.delivered_packets if 'hops_used' in p]
+             max_hops = max(hops_used) if hops_used else 0
+        max_hops_results[(num_nodes_sim, speed_sim)] = max_hops
+        print(f"  Maximum Hops Used: {max_hops}")
 
 
-    # Direction-Based Analysis (Aggregate from all nodes)
-    total_reward_by_direction = defaultdict(list)
-    success_rate_by_direction = defaultdict(list)
+        # Average Initial and Final TTL
+        avg_initial_ttl = 0
+        avg_final_ttl = 0
+        if Node.delivered_packets:
+            initial_ttls = [p['initial_ttl'] for p in Node.delivered_packets if 'initial_ttl' in p]
+            final_ttls = [p['final_ttl'] for p in Node.delivered_packets if 'final_ttl' in p]
+            avg_initial_ttl = np.mean(initial_ttls) if initial_ttls else 0
+            avg_final_ttl = np.mean(final_ttls) if final_ttls else 0
+        avg_initial_ttl_results[(num_nodes_sim, speed_sim)] = avg_initial_ttl
+        avg_final_ttl_results[(num_nodes_sim, speed_sim)] = avg_final_ttl
+        print(f"  Avg Initial TTL: {avg_initial_ttl:.2f}")
+        print(f"  Avg Final TTL: {avg_final_ttl:.2f}")
 
-    for node in config.nodes:
-        for direction, rewards in node.reward_by_direction.items():
-            if direction != -99:
-                total_reward_by_direction[direction].extend(rewards)
+        # Store results using (num_nodes_sim, speed_sim, src_dst_distance) as key, and also store src_dst_distance
+        key = (num_nodes_sim, speed_sim, src_dst_distance)
+        # Use a tuple with distance for all results
+        pdr_results[key] = pdr
+        e2e_delay_stats_results[key] = e2e_delay_stats if end_to_end_delays else None
+        throughput_results[key] = throughput_bps
+        avg_reward_results[key] = avg_reward_by_direction
+        avg_success_rate_results[key] = avg_success_rate_by_direction
+        min_energy_results[key] = min_energy
+        max_hops_results[key] = max_hops
+        avg_initial_ttl_results[key] = avg_initial_ttl
+        avg_final_ttl_results[key] = avg_final_ttl
+        simulation_duration_results[key] = simulation_duration
 
-        for direction, outcome in node.success_by_direction.items():
-             if direction != -99 and outcome["total"] > 0:
-                success_rate = outcome["success"] / outcome["total"]
-                success_rate_by_direction[direction].append(success_rate)
-             elif direction != -99 and outcome["total"] == 0:
-                 success_rate_by_direction[direction].append(0)
-
-    # Calculate averages here
-    avg_reward_by_direction = {d: np.mean(r) for d, r in total_reward_by_direction.items() if r}
-    avg_success_rate_by_direction = {d: np.mean(rates) for d, rates in success_rate_by_direction.items() if rates}
-
-    avg_reward_results[speed_sim] = avg_reward_by_direction
-    avg_success_rate_results[speed_sim] = avg_success_rate_by_direction
-    print(f"  Avg Reward by Direction: {avg_reward_by_direction}")
-    print(f"  Avg Success Rate by Direction: {avg_success_rate_by_direction}")
-
-
-    # Bloom Filter 'On' Bits
-    on_bits_counts = []
-    if Node.delivered_packets:
-        for packet_info in Node.delivered_packets:
-            # Retrieve the corresponding packet object to access the Bloom filter
-            packet_obj = None
-            destination_node = next((n for n in config.nodes if n.ip_address == destination.ip_address), None)
-            if destination_node:
-                for p in destination_node.opp_dest_packet:
-                    if p.creation_timestamp == packet_info.get('creation_timestamp'):
-                        packet_obj = p
-                        break
-
-            if packet_obj and hasattr(packet_obj, 'visited_nodes') and isinstance(packet_obj.visited_nodes, BloomFilter):
-                bloom_filter = packet_obj.visited_nodes
-                on_bits_count = sum(bin(byte).count('1') for byte in bloom_filter.bit_array)
-                on_bits_counts.append(on_bits_count)
-
-    if on_bits_counts:
-        avg_on_bits_stats = pd.Series(on_bits_counts).describe()
-        avg_on_bits_stats_results[speed_sim] = avg_on_bits_stats
-        print(f"  Avg Bloom Filter On Bits: {avg_on_bits_stats['mean']:.2f}")
-    else:
-        avg_on_bits_stats_results[speed_sim] = None
-        print("  Avg Bloom Filter On Bits: N/A (no delivered packets with Bloom filter data)")
-
-
-    # Minimum Remaining Energy
-    energies = [node.energy for node in config.nodes]
-    min_energy = min(energies) if energies else 0
-    min_energy_results[speed_sim] = min_energy
-    print(f"  Minimum Remaining Energy: {min_energy:.2f}%")
-
-
-    # Maximum Hops Used
-    max_hops = 0
-    if Node.delivered_packets:
-         hops_used = [p['hops_used'] for p in Node.delivered_packets if 'hops_used' in p]
-         max_hops = max(hops_used) if hops_used else 0
-    max_hops_results[speed_sim] = max_hops
-    print(f"  Maximum Hops Used: {max_hops}")
-
-
-    # Average Initial and Final TTL
-    avg_initial_ttl = 0
-    avg_final_ttl = 0
-    if Node.delivered_packets:
-        initial_ttls = [p['initial_ttl'] for p in Node.delivered_packets if 'initial_ttl' in p]
-        final_ttls = [p['final_ttl'] for p in Node.delivered_packets if 'final_ttl' in p]
-        avg_initial_ttl = np.mean(initial_ttls) if initial_ttls else 0
-        avg_final_ttl = np.mean(final_ttls) if final_ttls else 0
-    avg_initial_ttl_results[speed_sim] = avg_initial_ttl
-    avg_final_ttl_results[speed_sim] = avg_final_ttl
-    print(f"  Avg Initial TTL: {avg_initial_ttl:.2f}")
-    print(f"  Avg Final TTL: {avg_final_ttl:.2f}")
+        # --- CSV append for this simulation ---
+        with open(csv_results_path, mode='a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                num_nodes_sim,
+                speed_sim,
+                src_dst_distance,
+                pdr,
+                e2e_delay_stats['mean'] if end_to_end_delays else None,
+                e2e_delay_stats['50%'] if end_to_end_delays else None,
+                e2e_delay_stats['std'] if end_to_end_delays else None,
+                e2e_delay_stats['min'] if end_to_end_delays else None,
+                e2e_delay_stats['max'] if end_to_end_delays else None,
+                throughput_bps,
+                avg_reward_by_direction.get(1, None),
+                avg_reward_by_direction.get(0, None),
+                avg_reward_by_direction.get(-1, None),
+                avg_success_rate_by_direction.get(1, None),
+                avg_success_rate_by_direction.get(0, None),
+                avg_success_rate_by_direction.get(-1, None),
+                min_energy,
+                max_hops,
+                avg_initial_ttl,
+                avg_final_ttl,
+                simulation_duration
+            ])
 
 print("\n--- Simulation Runs Complete ---")
 
 # Initialize a dictionary to hold the summarized metrics
 performance_metrics_summary = {}
 
-# Iterate through each speed that was simulated
-for speed in speeds_to_simulate:
-    metrics_for_speed = {}
+# Iterate through each (num_nodes, speed, distance) tuple that was simulated
+for key in pdr_results.keys():
+    num_nodes, speed, src_dst_distance = key
+    metrics_for_key = {}
 
-    # 1. PDR
-    metrics_for_speed['PDR (%)'] = pdr_results.get(speed)
-
-    # 2. End-to-End Delay Statistics
-    e2e_delay_stats = e2e_delay_stats_results.get(speed)
+    metrics_for_key['Src-Dst Distance (m)'] = src_dst_distance
+    metrics_for_key['PDR (%)'] = pdr_results.get(key)
+    e2e_delay_stats = e2e_delay_stats_results.get(key)
     if e2e_delay_stats is not None:
-        metrics_for_speed['E2E Delay Mean (s)'] = e2e_delay_stats['mean']
-        metrics_for_speed['E2E Delay Median (s)'] = e2e_delay_stats['50%']
-        metrics_for_speed['E2E Delay Std (s)'] = e2e_delay_stats['std']
-        metrics_for_speed['E2E Delay Min (s)'] = e2e_delay_stats['min']
-        metrics_for_speed['E2E Delay Max (s)'] = e2e_delay_stats['max']
+        metrics_for_key['E2E Delay Mean (s)'] = e2e_delay_stats['mean']
+        metrics_for_key['E2E Delay Median (s)'] = e2e_delay_stats['50%']
+        metrics_for_key['E2E Delay Std (s)'] = e2e_delay_stats['std']
+        metrics_for_key['E2E Delay Min (s)'] = e2e_delay_stats['min']
+        metrics_for_key['E2E Delay Max (s)'] = e2e_delay_stats['max']
     else:
-        metrics_for_speed['E2E Delay Mean (s)'] = None
-        metrics_for_speed['E2E Delay Median (s)'] = None
-        metrics_for_speed['E2E Delay Std (s)'] = None
-        metrics_for_speed['E2E Delay Min (s)'] = None
-        metrics_for_speed['E2E Delay Max (s)'] = None
+        metrics_for_key['E2E Delay Mean (s)'] = None
+        metrics_for_key['E2E Delay Median (s)'] = None
+        metrics_for_key['E2E Delay Std (s)'] = None
+        metrics_for_key['E2E Delay Min (s)'] = None
+        metrics_for_key['E2E Delay Max (s)'] = None
 
+    metrics_for_key['Estimated Throughput (bps)'] = throughput_results.get(key)
+    avg_rewards = avg_reward_results.get(key, {})
+    metrics_for_key['Avg Reward Closer (+1)'] = avg_rewards.get(1, None)
+    metrics_for_key['Avg Reward Stationary (0)'] = avg_rewards.get(0, None)
+    metrics_for_key['Avg Reward Away (-1)'] = avg_rewards.get(-1, None)
+    avg_success_rates = avg_success_rate_results.get(key, {})
+    metrics_for_key['Avg Success Rate Closer (+1)'] = avg_success_rates.get(1, None)
+    metrics_for_key['Avg Success Rate Stationary (0)'] = avg_success_rates.get(0, None)
+    metrics_for_key['Avg Success Rate Away (-1)'] = avg_success_rates.get(-1, None)
+    metrics_for_key['Min Remaining Energy (%)'] = min_energy_results.get(key)
+    metrics_for_key['Max Hops Used'] = max_hops_results.get(key)
+    metrics_for_key['Avg Initial TTL'] = avg_initial_ttl_results.get(key)
+    metrics_for_key['Avg Final TTL'] = avg_final_ttl_results.get(key)
+    metrics_for_key['Simulation Duration (s)'] = simulation_duration_results.get(key)
 
-    # 3. Estimated Throughput
-    metrics_for_speed['Estimated Throughput (bps)'] = throughput_results.get(speed)
-
-    # 4. Direction-Based Rewards (store averages directly)
-    avg_rewards = avg_reward_results.get(speed, {})
-    metrics_for_speed['Avg Reward Closer (+1)'] = avg_rewards.get(1, None)
-    metrics_for_speed['Avg Reward Stationary (0)'] = avg_rewards.get(0, None)
-    metrics_for_speed['Avg Reward Away (-1)'] = avg_rewards.get(-1, None)
-
-    # 5. Direction-Based Success Rates (store averages directly)
-    avg_success_rates = avg_success_rate_results.get(speed, {})
-    metrics_for_speed['Avg Success Rate Closer (+1)'] = avg_success_rates.get(1, None)
-    metrics_for_speed['Avg Success Rate Stationary (0)'] = avg_success_rates.get(0, None)
-    metrics_for_speed['Avg Success Rate Away (-1)'] = avg_success_rates.get(-1, None)
-
-    # 6. Bloom Filter 'On' Bits Statistics
-    on_bits_stats = avg_on_bits_stats_results.get(speed)
-    if on_bits_stats is not None:
-        metrics_for_speed['BF On Bits Mean'] = on_bits_stats['mean']
-        metrics_for_speed['BF On Bits Median'] = on_bits_stats['50%']
-        metrics_for_speed['BF On Bits Std'] = on_bits_stats['std']
-        metrics_for_speed['BF On Bits Min'] = on_bits_stats['min']
-        metrics_for_speed['BF On Bits Max'] = on_bits_stats['max']
-    else:
-        metrics_for_speed['BF On Bits Mean'] = None
-        metrics_for_speed['BF On Bits Median'] = None
-        metrics_for_speed['BF On Bits Std'] = None
-        metrics_for_speed['BF On Bits Min'] = None
-        metrics_for_speed['BF On Bits Max'] = None
-
-
-    # 7. Minimum Remaining Energy
-    metrics_for_speed['Min Remaining Energy (%)'] = min_energy_results.get(speed)
-
-    # 8. Maximum Hops Used
-    metrics_for_speed['Max Hops Used'] = max_hops_results.get(speed)
-
-    # 9. Average Initial and Final TTL
-    metrics_for_speed['Avg Initial TTL'] = avg_initial_ttl_results.get(speed)
-    metrics_for_speed['Avg Final TTL'] = avg_final_ttl_results.get(speed)
-
-    # 10. Simulation Duration
-    metrics_for_speed['Simulation Duration (s)'] = simulation_duration_results.get(speed)
-
-    # Store the collected metrics for this speed
-    performance_metrics_summary[speed] = metrics_for_speed
+    # Use tuple (num_nodes, speed, src_dst_distance) as index
+    performance_metrics_summary[key] = metrics_for_key
 
 # Convert the summary dictionary to a Pandas DataFrame for better visualization and analysis
 performance_summary_df = pd.DataFrame.from_dict(performance_metrics_summary, orient='index')
+performance_summary_df.index.names = ['Num Nodes', 'Speed (m/s)', 'Src-Dst Distance (m)']
+
+# Save the summary DataFrame to CSV (append, for full summary)
+performance_summary_df.to_csv(csv_results_path, mode='a', header=True)
 
 # Display the summary DataFrame
 print("\n=== Performance Metrics Summary Across Speeds ===")
-print(performance_summary_df)  # Use print instead of display for compatibility
+print(performance_summary_df)
 
+# Print all metrics for each speed in a readable format
+print("\n=== Detailed Metrics for Each Speed ===")
+for speed in performance_summary_df.index:
+    print(f"\n--- Metrics for Speed {speed} m/s ---")
+    for metric, value in performance_summary_df.loc[speed].items():
+        print(f"{metric}: {value}")
 
 # Metrics to visualize as line plots
 line_plot_metrics = [
@@ -1952,91 +1414,54 @@ bar_plot_direction_metrics_success = [
     'Avg Success Rate Away (-1)'
 ]
 
-# Exclude Bloom Filter and Visited Nodes Size metrics as per instructions
-bar_plot_bf_metrics = [
-    'BF On Bits Mean'
-]
+# --- Show individual graphs/charts for each metric ---
 
-# Generate Line Plots
-print("Generating Line Plots for Performance Metrics vs. Node Speed:")
+# 1. Line plots for each line metric
+print("\nGenerating Individual Line Plots for Each Metric:")
 for metric in line_plot_metrics:
     if metric in performance_summary_df.columns:
-        # Replace None with np.nan for plotting
         y = performance_summary_df[metric].replace({None: np.nan})
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 5))
         plt.plot(performance_summary_df.index, y, marker='o', linestyle='-')
         plt.xlabel("Node Speed (m/s)")
         plt.ylabel(metric)
         plt.title(f"{metric} vs. Node Speed")
         plt.grid(True)
-        plt.xticks(performance_summary_df.index) # Ensure all speeds are shown as ticks
+        plt.xticks(performance_summary_df.index)
         plt.tight_layout()
         plt.show()
     else:
         print(f"Metric '{metric}' not found in performance_summary_df.")
 
-# Generate Bar Plots for Direction-Based Rewards
-print("\nGenerating Bar Plots for Average Reward by Direction vs. Node Speed:")
-plt.figure(figsize=(12, 8))
-bar_width = 0.8 / len(bar_plot_direction_metrics_reward) # Dynamic bar width based on number of categories
-x = np.arange(len(performance_summary_df.index))
-
-for i, metric in enumerate(bar_plot_direction_metrics_reward):
-     if metric in performance_summary_df.columns:
-        # Replace None with np.nan for plotting
+# 2. Bar plots for each direction-based reward metric
+print("\nGenerating Individual Bar Plots for Direction-Based Reward Metrics:")
+for metric in bar_plot_direction_metrics_reward:
+    if metric in performance_summary_df.columns:
         y = performance_summary_df[metric].replace({None: np.nan})
-        plt.bar(x + i * bar_width, y.fillna(0), bar_width, label=metric.replace('Avg Reward ', ''))
+        plt.figure(figsize=(8, 5))
+        plt.bar(performance_summary_df.index, y.fillna(0), width=0.6)
+        plt.xlabel("Node Speed (m/s)")
+        plt.ylabel(metric)
+        plt.title(f"{metric} vs. Node Speed")
+        plt.grid(axis='y', alpha=0.75)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"Metric '{metric}' not found in performance_summary_df.")
 
-plt.xlabel("Node Speed (m/s)")
-plt.ylabel("Average Reward")
-plt.title("Average Reward by Direction vs. Node Speed")
-plt.xticks(x + bar_width * (len(bar_plot_direction_metrics_reward) - 1) / 2, performance_summary_df.index, rotation=0) # Rotate x-axis labels
-plt.legend(title="Direction")
-plt.grid(axis='y', alpha=0.75)
-plt.tight_layout()
-plt.show()
-
-
-# Generate Bar Plots for Direction-Based Success Rates
-print("\nGenerating Bar Plots for Average Success Rate by Direction vs. Node Speed:")
-plt.figure(figsize=(12, 8))
-x = np.arange(len(performance_summary_df.index))
-bar_width = 0.8 / len(bar_plot_direction_metrics_success)
-
-for i, metric in enumerate(bar_plot_direction_metrics_success):
-     if metric in performance_summary_df.columns:
-        # Replace None with np.nan for plotting
+# 3. Bar plots for each direction-based success rate metric
+print("\nGenerating Individual Bar Plots for Direction-Based Success Rate Metrics:")
+for metric in bar_plot_direction_metrics_success:
+    if metric in performance_summary_df.columns:
         y = performance_summary_df[metric].replace({None: np.nan})
-        plt.bar(x + i * bar_width, y.fillna(0), bar_width, label=metric.replace('Avg Success Rate ', ''))
-
-plt.xlabel("Node Speed (m/s)")
-plt.ylabel("Average Success Rate")
-plt.title("Average Success Rate by Direction vs. Node Speed")
-plt.xticks(x + bar_width * (len(bar_plot_direction_metrics_success) - 1) / 2, performance_summary_df.index, rotation=0) # Rotate x-axis labels
-plt.legend(title="Direction")
-plt.ylim(0, 1.1) # Success rate is between 0 and 1, add a little buffer
-plt.grid(axis='y', alpha=0.75)
-plt.tight_layout()
-plt.show()
-
-# Generate Bar Plots for Bloom Filter Stats
-print("\nGenerating Bar Plots for Bloom Filter On Bits Mean vs. Node Speed:")
-plt.figure(figsize=(12, 8))
-x = np.arange(len(performance_summary_df.index))
-bar_width = 0.8 / len(bar_plot_bf_metrics)
-
-
-for i, metric in enumerate(bar_plot_bf_metrics):
-     if metric in performance_summary_df.columns:
-        # Replace None with np.nan for plotting
-        y = performance_summary_df[metric].replace({None: np.nan})
-        plt.bar(x + i * bar_width, y.fillna(0), bar_width, label=metric.replace('Mean', ''))
-
-plt.xlabel("Node Speed (m/s)")
-plt.ylabel("Number of On bits")
-plt.title("Bloom Filter vs. Node Speed")
-plt.xticks(x + bar_width * (len(bar_plot_bf_metrics) - 1) / 2, performance_summary_df.index, rotation=0) # Rotate x-axis labels
-plt.legend()
-plt.grid(axis='y', alpha=0.75)
-plt.tight_layout()
-plt.show()
+        plt.figure(figsize=(8, 5))
+        plt.bar(performance_summary_df.index, y.fillna(0), width=0.6)
+        plt.xlabel("Node Speed (m/s)")
+        plt.ylabel(metric)
+        plt.title(f"{metric} vs. Node Speed")
+        plt.ylim(0, 1.1)
+        plt.grid(axis='y', alpha=0.75)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"Metric '{metric}' not found in performance_summary_df.")
