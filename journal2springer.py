@@ -10,10 +10,6 @@ import time
 from collections import defaultdict, deque
 import numpy as np
 import pandas as pd
-from datetime import datetime
-import matplotlib.pyplot as plt
-import zlib # Import zlib for CRC32
-import mmh3 # Import MurmurHash3 for better hashing
 import sys # Import sys for object size analysis
 # import tgnn # Import TGNN for graph neural network-based forwarding
 import torch
@@ -24,6 +20,18 @@ from torch_geometric.data import Data as PyGData
 from torch_geometric.nn import NNConv, GCNConv
 import csv
 import os
+import zlib  # <-- Add this import
+from datetime import datetime  # <-- Add this import
+
+# === Global constants ===
+GNN_WEIGHTS_PATH = "gnn_forward_agent_weights.pt"
+
+# --- Add global variable for noise level ---
+NOISE_LEVEL = 0.0  # Default, will be set in simulation loop
+
+# --- Add global simulation time variable ---
+current_sim_time = 0.0  # Simulation time in seconds
+SIM_TIME_STEP = 1.0     # Simulation time step per loop iteration (seconds)
 
 # === Custom Online TGNN Model (NNConv + edge features) ===
 class CustomOnlineTGNN(nn.Module):
@@ -149,7 +157,8 @@ class OppPacket:
         self.source_ip = source_ip
         self.destination_ip = destination_ip
         self.ttl = ttl
-        self.creation_timestamp = datetime.now()
+        self.creation_timestamp = None  # Will be set at creation using current_sim_time
+        self.delivery_timestamp = None  # Will be set at delivery using current_sim_time
         self.initial_ttl = ttl
         self.delivered = False
         self.current_hop_mac = source_mac_address
@@ -405,6 +414,8 @@ class Node:
             packet = self.create_packet(destination_ip, ttl, self.mac_address, self.x, self.y, self.z)
             if packet:
                 Node.packet_sent_count += 1
+                # Set creation_timestamp using simulation time
+                packet.creation_timestamp = current_sim_time
                 self.opp_packet_queue.append(packet)
                 return True
         return False
@@ -420,9 +431,8 @@ class Node:
             source_y=source_y,
             source_z=source_z
         )
-        # Explicitly set the creation_timestamp when the packet is created
-        packet.creation_timestamp = datetime.now()
-        # visited_nodes and other attributes are initialized in OppPacket.__init__
+        # Set creation_timestamp using simulation time (handled in send_packet)
+        # packet.creation_timestamp = datetime.now()  # REMOVE
         return packet
 
     def process_queue(self):
@@ -451,20 +461,27 @@ class Node:
         current_node = self
         opp_packet.current_hop_mac = current_node.mac_address
 
+        # --- Simulate channel noise: randomly drop packet with probability NOISE_LEVEL ---
+        if NOISE_LEVEL > 0.0 and random.random() < NOISE_LEVEL:
+            Node.drop_count += 1
+            return False  # Packet dropped due to noise
+
         # 1. Check if destination
         if current_node.ip_address == opp_packet.destination_ip:
             if hasattr(opp_packet, "delivered") and opp_packet.delivered:
                 return True
             opp_packet.delivered = True
             Node.packet_delivered_count += 1
-            print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {datetime.now()}")
+            # Set delivery_timestamp using simulation time
+            opp_packet.delivery_timestamp = current_sim_time
+            print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {opp_packet.delivery_timestamp}")
 
             Node.delivered_packets.append({
                 'initial_ttl': opp_packet.initial_ttl,
                 'final_ttl': opp_packet.ttl,
                 'hops_used': opp_packet.initial_ttl - opp_packet.ttl,
                 'creation_timestamp': opp_packet.creation_timestamp,
-                'delivery_timestamp': datetime.now()
+                'delivery_timestamp': opp_packet.delivery_timestamp
             })
 
             packet_size = sys.getsizeof(opp_packet) + sum(sys.getsizeof(attr_value) for attr_value in opp_packet.__dict__.values())
@@ -516,6 +533,124 @@ class Node:
             Node.drop_count += 1
             return False
 
+# === Custom GRU Cell Implementation ===
+class CustomGRUCell(nn.Module):
+    """
+    Custom GRU cell for MANET routing with learnable trust, congestion, and direction factors.
+    Features:
+      - All input features normalized before concatenation.
+      - Learnable scaling for trust, congestion, and direction factors.
+      - Robust to missing/noisy features via masking/defaults.
+      - Dropout and extra layers for regularization and expressiveness.
+      - Proper batch support and variable-length handling.
+      - Direction factor: +1 (closer), 0 (stationary), -1 (away).
+    Args:
+      emb_dim: int, node embedding dimension.
+      mob_dim: int, mobility feature dimension.
+      hidden_dim: int, hidden state dimension.
+      dropout_p: float, dropout probability.
+    """
+    def __init__(self, emb_dim, mob_dim=2, hidden_dim=64, dropout_p=0.1):
+        super().__init__()
+        self.input_dim = emb_dim + mob_dim + 1 + 1 + 1 + 1 + 1 + 1
+        self.hidden_dim = hidden_dim
+
+        # Learnable scaling factors for each gate
+        self.energy_weight = nn.Parameter(torch.tensor(1.0))
+        self.time_weight = nn.Parameter(torch.tensor(1.0))
+        self.mobility_weight = nn.Parameter(torch.tensor(1.0))
+        self.congestion_weight = nn.Parameter(torch.tensor(1.0))
+        self.trust_weight = nn.Parameter(torch.tensor(1.0))
+
+        self.dropout = nn.Dropout(dropout_p)
+        self.linear_z1 = nn.Linear(self.input_dim + hidden_dim, hidden_dim)
+        self.linear_z2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear_r1 = nn.Linear(self.input_dim + hidden_dim, hidden_dim)
+        self.linear_r2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear_h1 = nn.Linear(self.input_dim + hidden_dim, hidden_dim)
+        self.linear_h2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln = nn.LayerNorm(self.input_dim + hidden_dim)
+
+    def normalize(self, x, mask=None, default=0.0):
+        # Normalize to [0,1] if possible, else fallback to default
+        if mask is not None:
+            x = torch.where(mask, x, torch.tensor(default, device=x.device, dtype=x.dtype))
+        x_min = torch.amin(x, dim=0, keepdim=True)
+        x_max = torch.amax(x, dim=0, keepdim=True)
+        denom = (x_max - x_min).clamp(min=1e-6)
+        return (x - x_min) / denom
+
+    def forward(self, input_emb, mobility, energy, drop_prob, time_feat, trust_score, queue_length, direction, h_prev, mask=None):
+        """
+        Args:
+          input_emb: [batch, emb_dim]
+          mobility: [batch, mob_dim]
+          energy: [batch, 1]
+          drop_prob: [batch, 1]
+          time_feat: [batch, 1]
+          trust_score: [batch, 1]
+          queue_length: [batch, 1]
+          direction: [batch, 1] (+1, 0, -1)
+          h_prev: [batch, hidden_dim]
+          mask: [batch, input_dim] or None, True for valid, False for missing
+        Returns:
+          h_new: [batch, hidden_dim]
+        """
+        # Robust normalization and masking
+        input_emb = self.normalize(input_emb)
+        mobility = self.normalize(mobility)
+        energy = self.normalize(energy)
+        drop_prob = self.normalize(drop_prob)
+        time_feat = self.normalize(time_feat)
+        trust_score = self.normalize(trust_score)
+        queue_length = self.normalize(queue_length)
+        # Direction: map +1->1, 0->0.5, -1->0
+        direction_norm = (direction + 1) / 2.0  # +1=1, 0=0.5, -1=0
+        direction_norm = direction_norm.clamp(0, 1)
+
+        # Handle missing features (mask or default)
+        if mask is not None:
+            input_emb = torch.where(mask[:, :input_emb.shape[1]], input_emb, torch.zeros_like(input_emb))
+            mobility = torch.where(mask[:, input_emb.shape[1]:input_emb.shape[1]+mobility.shape[1]], mobility, torch.zeros_like(mobility))
+            # ...repeat for other features as needed...
+
+        # Concatenate all normalized features
+        x = torch.cat([input_emb, mobility, energy, drop_prob, time_feat, trust_score, queue_length, direction_norm], dim=-1)
+        x = self.dropout(x)
+        combined = torch.cat([x, h_prev], dim=-1)
+        combined = self.ln(combined)
+
+        # Standard GRU gates
+        z = torch.sigmoid(self.linear_z2(F.gelu(self.linear_z1(combined))))
+        r = torch.sigmoid(self.linear_r2(F.gelu(self.linear_r1(combined))))
+        combined_reset = torch.cat([x, r * h_prev], dim=-1)
+        combined_reset = self.ln(combined_reset)
+        h_tilde = torch.tanh(self.linear_h2(F.gelu(self.linear_h1(combined_reset))))
+        h_tilde = self.dropout(h_tilde)
+
+        # MANET-aware gates
+        # Energy Gate
+        energy_gate = torch.sigmoid(self.energy_weight * energy)
+        # Time Gate (exponential decay, assume time_feat is Δt normalized)
+        time_decay = torch.exp(-time_feat)
+        time_gate = torch.sigmoid(self.time_weight * time_decay)
+        # Mobility Gate (relative speed + direction)
+        mobility_feat = torch.cat([mobility, direction_norm], dim=-1)
+        mobility_gate = torch.sigmoid(self.mobility_weight * mobility_feat.mean(dim=-1, keepdim=True))
+        # Congestion Gate (inverse queue occupancy)
+        congestion_gate = torch.sigmoid(self.congestion_weight * (1 - queue_length))
+        # Trust Gate
+        trust_gate = torch.sigmoid(self.trust_weight * trust_score)
+
+        # Unified gate modulation
+        update_gate = z * energy_gate * time_gate * mobility_gate * congestion_gate * trust_gate
+        reset_gate = r * energy_gate * mobility_gate * trust_gate
+        candidate_gate = h_tilde * energy_gate * mobility_gate * trust_gate
+
+        # Final hidden state update
+        h_new = (1 - update_gate) * h_prev + update_gate * candidate_gate
+        return h_new
+
 # === GCN-based GNN for neighbor scoring (from reference) ===
 class GCNNeighborScorer(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
@@ -549,6 +684,24 @@ class GNNForwardAgent:
         self.optimizer = torch.optim.Adam(self.gnn.parameters(), lr=0.002)
         self.last_x = None
         self.last_edge_index = None
+        # Load weights if available
+        self.load_weights()
+
+    def load_weights(self):
+        if os.path.exists(GNN_WEIGHTS_PATH):
+            try:
+                state = torch.load(GNN_WEIGHTS_PATH, map_location="cpu")
+                self.gnn.load_state_dict(state)
+                print(f"Loaded GNN weights from {GNN_WEIGHTS_PATH}")
+            except Exception as e:
+                print(f"Failed to load GNN weights: {e}")
+
+    def save_weights(self):
+        try:
+            torch.save(self.gnn.state_dict(), GNN_WEIGHTS_PATH)
+            print(f"Saved GNN weights to {GNN_WEIGHTS_PATH}")
+        except Exception as e:
+            print(f"Failed to save GNN weights: {e}")
 
     def update_neighbors(self):
         self.neighbors = []
@@ -629,6 +782,8 @@ class GNNForwardAgent:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        # Save weights after online update
+        self.save_weights()
 
 # === Patch Node to use GNNForwardAgent for forwarding ===
 class Node:
@@ -856,6 +1011,8 @@ class Node:
             packet = self.create_packet(destination_ip, ttl, self.mac_address, self.x, self.y, self.z)
             if packet:
                 Node.packet_sent_count += 1
+                # Set creation_timestamp using simulation time
+                packet.creation_timestamp = current_sim_time
                 self.opp_packet_queue.append(packet)
                 return True
         return False
@@ -871,9 +1028,8 @@ class Node:
             source_y=source_y,
             source_z=source_z
         )
-        # Explicitly set the creation_timestamp when the packet is created
-        packet.creation_timestamp = datetime.now()
-        # visited_nodes and other attributes are initialized in OppPacket.__init__
+        # Set creation_timestamp using simulation time (handled in send_packet)
+        # packet.creation_timestamp = datetime.now()  # REMOVE
         return packet
 
     def process_queue(self):
@@ -902,20 +1058,27 @@ class Node:
         current_node = self
         opp_packet.current_hop_mac = current_node.mac_address
 
+        # --- Simulate channel noise: randomly drop packet with probability NOISE_LEVEL ---
+        if NOISE_LEVEL > 0.0 and random.random() < NOISE_LEVEL:
+            Node.drop_count += 1
+            return False  # Packet dropped due to noise
+
         # 1. Check if destination
         if current_node.ip_address == opp_packet.destination_ip:
             if hasattr(opp_packet, "delivered") and opp_packet.delivered:
                 return True
             opp_packet.delivered = True
             Node.packet_delivered_count += 1
-            print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {datetime.now()}")
+            # Set delivery_timestamp using simulation time
+            opp_packet.delivery_timestamp = current_sim_time
+            print(f"Packet delivered! Source: {opp_packet.source_ip}, Dest: {opp_packet.destination_ip}, Created: {opp_packet.creation_timestamp}, Delivered at: {opp_packet.delivery_timestamp}")
 
             Node.delivered_packets.append({
                 'initial_ttl': opp_packet.initial_ttl,
                 'final_ttl': opp_packet.ttl,
                 'hops_used': opp_packet.initial_ttl - opp_packet.ttl,
                 'creation_timestamp': opp_packet.creation_timestamp,
-                'delivery_timestamp': datetime.now()
+                'delivery_timestamp': opp_packet.delivery_timestamp
             })
 
             packet_size = sys.getsizeof(opp_packet) + sum(sys.getsizeof(attr_value) for attr_value in opp_packet.__dict__.values())
@@ -1072,9 +1235,12 @@ class Opportunistic:
 
 # Define the node counts and speeds to simulate
 num_nodes_list = list(range(100, 600, 100))  # 100, 200, 300, 400, 500
-speeds_to_simulate = list(range(20, 41, 5))  # 20, 25, 30, 35, 40
+speeds_to_simulate =  [20]#list(range(20, 41, 5))  # 20, 25, 30, 35, 40
 
-# Initialize dictionaries to store results for each (num_nodes, speed) pair
+# --- Add this line to define noise_levels ---
+noise_levels = [0.0,0.05,0.1,0.15,0.2]  # You can add more values, e.g., [0.0, 0.05, 0.1, 0.2]
+
+# --- Update all metrics dictionaries to use (num_nodes, speed, noise_level, src_dst_distance) as key ---
 pdr_results = {}
 e2e_delay_stats_results = {}
 throughput_results = {}
@@ -1095,246 +1261,261 @@ if not os.path.exists(csv_results_path) or os.path.getsize(csv_results_path) == 
     with open(csv_results_path, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            "Num Nodes", "Speed (m/s)", "Src-Dst Distance (m)", "PDR (%)", "E2E Delay Mean (s)", "E2E Delay Median (s)", "E2E Delay Std (s)",
+            "Num Nodes", "Speed (m/s)", "Noise Level", "Src-Dst Distance (m)", "PDR (%)", "E2E Delay Mean (s)", "E2E Delay Median (s)", "E2E Delay Std (s)",
             "E2E Delay Min (s)", "E2E Delay Max (s)", "Estimated Throughput (bps)",
             "Avg Reward Closer (+1)", "Avg Reward Stationary (0)", "Avg Reward Away (-1)",
             "Avg Success Rate Closer (+1)", "Avg Success Rate Stationary (0)", "Avg Success Rate Away (-1)",
             "Min Remaining Energy (%)", "Max Hops Used", "Avg Initial TTL", "Avg Final TTL", "Simulation Duration (s)"
         ])
 
-for num_nodes_sim in num_nodes_list:
-    for speed_sim in speeds_to_simulate:
-        print(f"\n--- Running Simulation with {num_nodes_sim} Nodes at Speed {speed_sim} m/s ---")
+# --- Outer loop over noise levels ---
+for noise_level in noise_levels:
+    # global NOISE_LEVEL
+    NOISE_LEVEL = noise_level
+    print(f"\n=== Running Simulations with Noise Level {noise_level} ===")
+    for num_nodes_sim in num_nodes_list:
+        for speed_sim in speeds_to_simulate:
+            print(f"\n--- Running Simulation with {num_nodes_sim} Nodes at Speed {speed_sim} m/s, Noise Level {noise_level} ---")
 
-        # Reset static counters and lists for metrics
-        Node.packet_sent_count = 0
-        Node.packet_delivered_count = 0
-        Node.drop_count = 0
-        Node.delivered_packets = []
-        Node.delivered_packet_sizes = []
-        Node.delivered_visited_nodes_sizes = []
+            # Reset static counters and lists for metrics
+            Node.packet_sent_count = 0
+            Node.packet_delivered_count = 0
+            Node.drop_count = 0
+            Node.delivered_packets = []
+            Node.delivered_packet_sizes = []
+            Node.delivered_visited_nodes_sizes = []
 
-        # Setup network - pass num_nodes_sim to Configure
-        config = Configure(num_nodes=num_nodes_sim)
-        opportunistic = Opportunistic(config)
-        mobility = MobilityModel(config, space_dim=1000, speed_range=(speed_sim, speed_sim))
+            # Setup network - pass num_nodes_sim to Configure
+            config = Configure(num_nodes=num_nodes_sim)
+            opportunistic = Opportunistic(config)
+            mobility = MobilityModel(config, space_dim=1000, speed_range=(speed_sim, speed_sim))
 
-        # --- Select source and destination nodes with distance > 250m ---
-        # Try all pairs until a valid pair is found
-        found_pair = False
-        for i in range(len(config.nodes)):
-            for j in range(len(config.nodes)):
-                if i == j:
-                    continue
-                src_candidate = config.nodes[i]
-                dst_candidate = config.nodes[j]
-                dist = src_candidate.distance_to(dst_candidate)
-                if dist > 250:
-                    source = src_candidate
-                    destination = dst_candidate
-                    src_dst_distance = dist
-                    found_pair = True
-                    break
-            if found_pair:
-                break
-        if not found_pair:
-            print("Warning: Could not find a source-destination pair with distance > 250m. Skipping this simulation.")
-            continue
-
-        # Define packet transmission configuration
-        total_packets_to_send = 100 # Send only 300 packets
-        packets_per_second = 20 # Increased packet sending rate
-        sent_packet_count = 0
-        simulation_steps = math.ceil(total_packets_to_send / packets_per_second) + 50  # more extra steps for late deliveries
-
-
-        # --- Simulation Loop ---
-        start_time = time.time()
-        for timestep in range(simulation_steps):
-            # print(f"--- Time step {timestep} ---") # Suppress detailed timestep logging
-
-            # 1. Update node positions
-            mobility.update_positions()
-
-            # 2. Discover neighbors (Hello packets exchanged)
-            opportunistic.forwarder()
-
-            # 3. Send packets this step (if not all sent)
-            if sent_packet_count < total_packets_to_send:
-                packets_this_step = min(packets_per_second, total_packets_to_send - sent_packet_count)
-                for _ in range(packets_this_step):
-                    source.send_packet(destination.ip_address)
-                sent_packet_count += packets_this_step
-
-            # 4. Node updates: position logging, queue processing, and distance update processing
+            # --- Load GNN weights for all agents before simulation ---
             for node in config.nodes:
-                node.update_position_log()
-                node.process_queue() # Process OppPackets
-                node.process_distance_updates() # Process DistanceUpdatePackets
+                if hasattr(node, "gnn_agent") and node.gnn_agent is not None:
+                    node.gnn_agent.load_weights()
 
-            # Optional: simulate real time
-            # time.sleep(0.01)
+            # --- Select source and destination nodes with distance > 250m ---
+            # Try all pairs until a valid pair is found
+            found_pair = False
+            for i in range(len(config.nodes)):
+                for j in range(len(config.nodes)):
+                    if i == j:
+                        continue
+                    src_candidate = config.nodes[i]
+                    dst_candidate = config.nodes[j]
+                    dist = src_candidate.distance_to(dst_candidate)
+                    if dist > 250:
+                        source = src_candidate
+                        destination = dst_candidate
+                        src_dst_distance = dist
+                        found_pair = True
+                        break
+                if found_pair:
+                    break
+            if not found_pair:
+                print("Warning: Could not find a source-destination pair with distance > 250m. Skipping this simulation.")
+                continue
 
-            # Log intermediate results every 20 steps
-            if timestep % 20 == 0 or timestep == simulation_steps - 1:
-                total_sent = Node.packet_sent_count
-                total_delivered = Node.packet_delivered_count
-                total_dropped = Node.drop_count
-                pdr = (total_delivered / total_sent) * 100 if total_sent > 0 else 0.0
-                print(f"[Step {timestep}] Sent: {total_sent}, Delivered: {total_delivered}, Dropped: {total_dropped}, PDR: {pdr:.2f}%")
-
-        end_time = time.time()
-        simulation_duration = end_time - start_time
-        simulation_duration_results[(num_nodes_sim, speed_sim)] = simulation_duration
-        print(f"Simulation with {num_nodes_sim} nodes at speed {speed_sim} m/s finished in {simulation_duration:.2f} seconds.")
-
-        # --- Calculate Performance Metrics ---
-
-        # PDR
-        total_packets_sent = Node.packet_sent_count
-        total_packets_delivered = Node.packet_delivered_count
-        pdr = (total_packets_delivered / total_packets_sent) * 100 if total_packets_sent > 0 else 0.0
-        pdr_results[(num_nodes_sim, speed_sim)] = pdr
-        print(f"  PDR: {pdr:.2f}%")
-
-
-        # End-to-End Delay
-        end_to_end_delays = []
-        if Node.delivered_packets:
-            for packet_info in Node.delivered_packets:
-                if 'creation_timestamp' in packet_info and 'delivery_timestamp' in packet_info:
-                    creation_time = packet_info['creation_timestamp']
-                    delivery_time = packet_info['delivery_timestamp']
-                    delay = (delivery_time - creation_time).total_seconds()
-                    end_to_end_delays.append(delay)
-        if end_to_end_delays:
-            e2e_delay_stats = pd.Series(end_to_end_delays).describe()
-            e2e_delay_stats_results[(num_nodes_sim, speed_sim)] = e2e_delay_stats
-            print(f"  Avg E2E Delay: {e2e_delay_stats['mean']:.2f} seconds")
-        else:
-            e2e_delay_stats_results[(num_nodes_sim, speed_sim)] = None
-            print("  Avg E2E Delay: N/A (no delivered packets)")
+            # Define packet transmission configuration
+            total_packets_to_send = 100 # Send only 300 packets
+            packets_per_second = 20 # Increased packet sending rate
+            sent_packet_count = 0
+            simulation_steps = math.ceil(total_packets_to_send / packets_per_second) + 50  # more extra steps for late deliveries
 
 
-        # Estimated Throughput
-        estimated_average_packet_size_bytes = 0
-        if Node.delivered_packet_sizes:
-            estimated_average_packet_size_bytes = np.mean(Node.delivered_packet_sizes)
+            # --- Simulation Loop ---
+            start_time = time.time()
+            for timestep in range(simulation_steps):
+                # print(f"--- Time step {timestep} ---") # Suppress detailed timestep logging
 
-        throughput_bps = 0
-        if total_packets_delivered > 0 and simulation_duration > 0 and estimated_average_packet_size_bytes > 0:
-            total_data_delivered_bytes = total_packets_delivered * estimated_average_packet_size_bytes
-            total_data_delivered_bits = total_data_delivered_bytes * 8
-            throughput_bps = total_data_delivered_bits / simulation_duration
+                # 1. Update node positions
+                mobility.update_positions()
 
-        throughput_results[(num_nodes_sim, speed_sim)] = throughput_bps
-        print(f"  Estimated Throughput: {throughput_bps / 1000:.2f} Kbps")
+                # 2. Discover neighbors (Hello packets exchanged)
+                opportunistic.forwarder()
 
+                # 3. Send packets this step (if not all sent)
+                if sent_packet_count < total_packets_to_send:
+                    packets_this_step = min(packets_per_second, total_packets_to_send - sent_packet_count)
+                    for _ in range(packets_this_step):
+                        source.send_packet(destination.ip_address)
+                    sent_packet_count += packets_this_step
 
-        # Direction-Based Analysis (Aggregate from all nodes)
-        total_reward_by_direction = defaultdict(list)
-        success_rate_by_direction = defaultdict(list)
+                # 4. Node updates: position logging, queue processing, and distance update processing
+                for node in config.nodes:
+                    node.update_position_log()
+                    node.process_queue() # Process OppPackets
+                    node.process_distance_updates() # Process DistanceUpdatePackets
 
-        for node in config.nodes:
-            for direction, rewards in node.reward_by_direction.items():
-                if direction != -99:
-                    total_reward_by_direction[direction].extend(rewards)
+                # Optional: simulate real time
+                # time.sleep(0.01)
 
-            for direction, outcome in node.success_by_direction.items():
-                 if direction != -99 and outcome["total"] > 0:
-                    success_rate = outcome["success"] / outcome["total"]
-                    success_rate_by_direction[direction].append(success_rate)
-                 elif direction != -99 and outcome["total"] == 0:
-                     success_rate_by_direction[direction].append(0)
+                # --- Increment simulation time ---
+                current_sim_time += SIM_TIME_STEP
 
-        # Calculate averages here
-        avg_reward_by_direction = {d: np.mean(r) for d, r in total_reward_by_direction.items() if r}
-        avg_success_rate_by_direction = {d: np.mean(rates) for d, rates in success_rate_by_direction.items() if rates}
+                # Log intermediate results every 20 steps
+                if timestep % 20 == 0 or timestep == simulation_steps - 1:
+                    total_sent = Node.packet_sent_count
+                    total_delivered = Node.packet_delivered_count
+                    total_dropped = Node.drop_count
+                    pdr = (total_delivered / total_sent) * 100 if total_sent > 0 else 0.0
+                    print(f"[Step {timestep}] Sent: {total_sent}, Delivered: {total_delivered}, Dropped: {total_dropped}, PDR: {pdr:.2f}%")
 
-        avg_reward_results[(num_nodes_sim, speed_sim)] = avg_reward_by_direction
-        avg_success_rate_results[(num_nodes_sim, speed_sim)] = avg_success_rate_by_direction
-        print(f"  Avg Reward by Direction: {avg_reward_by_direction}")
-        print(f"  Avg Success Rate by Direction: {avg_success_rate_by_direction}")
+            end_time = time.time()
+            simulation_duration = end_time - start_time
+            simulation_duration_results[(num_nodes_sim, speed_sim, noise_level)] = simulation_duration
+            print(f"Simulation with {num_nodes_sim} nodes at speed {speed_sim} m/s, noise level {noise_level} finished in {simulation_duration:.2f} seconds.")
 
+            # --- Calculate Performance Metrics ---
 
-        # Minimum Remaining Energy
-        energies = [node.energy for node in config.nodes]
-        min_energy = min(energies) if energies else 0
-        min_energy_results[(num_nodes_sim, speed_sim)] = min_energy
-        print(f"  Minimum Remaining Energy: {min_energy:.2f}%")
-
-
-        # Maximum Hops Used
-        max_hops = 0
-        if Node.delivered_packets:
-             hops_used = [p['hops_used'] for p in Node.delivered_packets if 'hops_used' in p]
-             max_hops = max(hops_used) if hops_used else 0
-        max_hops_results[(num_nodes_sim, speed_sim)] = max_hops
-        print(f"  Maximum Hops Used: {max_hops}")
+            # PDR
+            total_packets_sent = Node.packet_sent_count
+            total_packets_delivered = Node.packet_delivered_count
+            pdr = (total_packets_delivered / total_packets_sent) * 100 if total_packets_sent > 0 else 0.0
+            pdr_results[(num_nodes_sim, speed_sim, noise_level)] = pdr
+            print(f"  PDR: {pdr:.2f}%")
 
 
-        # Average Initial and Final TTL
-        avg_initial_ttl = 0
-        avg_final_ttl = 0
-        if Node.delivered_packets:
-            initial_ttls = [p['initial_ttl'] for p in Node.delivered_packets if 'initial_ttl' in p]
-            final_ttls = [p['final_ttl'] for p in Node.delivered_packets if 'final_ttl' in p]
-            avg_initial_ttl = np.mean(initial_ttls) if initial_ttls else 0
-            avg_final_ttl = np.mean(final_ttls) if final_ttls else 0
-        avg_initial_ttl_results[(num_nodes_sim, speed_sim)] = avg_initial_ttl
-        avg_final_ttl_results[(num_nodes_sim, speed_sim)] = avg_final_ttl
-        print(f"  Avg Initial TTL: {avg_initial_ttl:.2f}")
-        print(f"  Avg Final TTL: {avg_final_ttl:.2f}")
+            # End-to-End Delay
+            end_to_end_delays = []
+            if Node.delivered_packets:
+                for packet_info in Node.delivered_packets:
+                    if 'creation_timestamp' in packet_info and 'delivery_timestamp' in packet_info:
+                        creation_time = packet_info['creation_timestamp']
+                        delivery_time = packet_info['delivery_timestamp']
+                        # Calculate delay using simulation time (float)
+                        delay = delivery_time - creation_time
+                        end_to_end_delays.append(delay)
+            if end_to_end_delays:
+                e2e_delay_stats = pd.Series(end_to_end_delays).describe()
+                e2e_delay_stats_results[(num_nodes_sim, speed_sim, noise_level)] = e2e_delay_stats
+                print(f"  Avg E2E Delay: {e2e_delay_stats['mean']:.2f} seconds")
+            else:
+                e2e_delay_stats_results[(num_nodes_sim, speed_sim, noise_level)] = None
+                print("  Avg E2E Delay: N/A (no delivered packets)")
 
-        # Store results using (num_nodes_sim, speed_sim, src_dst_distance) as key, and also store src_dst_distance
-        key = (num_nodes_sim, speed_sim, src_dst_distance)
-        # Use a tuple with distance for all results
-        pdr_results[key] = pdr
-        e2e_delay_stats_results[key] = e2e_delay_stats if end_to_end_delays else None
-        throughput_results[key] = throughput_bps
-        avg_reward_results[key] = avg_reward_by_direction
-        avg_success_rate_results[key] = avg_success_rate_by_direction
-        min_energy_results[key] = min_energy
-        max_hops_results[key] = max_hops
-        avg_initial_ttl_results[key] = avg_initial_ttl
-        avg_final_ttl_results[key] = avg_final_ttl
-        simulation_duration_results[key] = simulation_duration
 
-        # --- CSV append for this simulation ---
-        with open(csv_results_path, mode='a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([
-                num_nodes_sim,
-                speed_sim,
-                src_dst_distance,
-                pdr,
-                e2e_delay_stats['mean'] if end_to_end_delays else None,
-                e2e_delay_stats['50%'] if end_to_end_delays else None,
-                e2e_delay_stats['std'] if end_to_end_delays else None,
-                e2e_delay_stats['min'] if end_to_end_delays else None,
-                e2e_delay_stats['max'] if end_to_end_delays else None,
-                throughput_bps,
-                avg_reward_by_direction.get(1, None),
-                avg_reward_by_direction.get(0, None),
-                avg_reward_by_direction.get(-1, None),
-                avg_success_rate_by_direction.get(1, None),
-                avg_success_rate_by_direction.get(0, None),
-                avg_success_rate_by_direction.get(-1, None),
-                min_energy,
-                max_hops,
-                avg_initial_ttl,
-                avg_final_ttl,
-                simulation_duration
-            ])
+            # Estimated Throughput
+            estimated_average_packet_size_bytes = 0
+            if Node.delivered_packet_sizes:
+                estimated_average_packet_size_bytes = np.mean(Node.delivered_packet_sizes)
+
+            throughput_bps = 0
+            if total_packets_delivered > 0 and simulation_duration > 0 and estimated_average_packet_size_bytes > 0:
+                total_data_delivered_bytes = total_packets_delivered * estimated_average_packet_size_bytes
+                total_data_delivered_bits = total_data_delivered_bytes * 8
+                throughput_bps = total_data_delivered_bits / simulation_duration
+
+            throughput_results[(num_nodes_sim, speed_sim, noise_level)] = throughput_bps
+            print(f"  Estimated Throughput: {throughput_bps / 1000:.2f} Kbps")
+
+
+            # Direction-Based Analysis (Aggregate from all nodes)
+            total_reward_by_direction = defaultdict(list)
+            success_rate_by_direction = defaultdict(list)
+
+            for node in config.nodes:
+                for direction, rewards in node.reward_by_direction.items():
+                    if direction != -99:
+                        total_reward_by_direction[direction].extend(rewards)
+
+                for direction, outcome in node.success_by_direction.items():
+                     if direction != -99 and outcome["total"] > 0:
+                        success_rate = outcome["success"] / outcome["total"]
+                        success_rate_by_direction[direction].append(success_rate)
+                     elif direction != -99 and outcome["total"] == 0:
+                         success_rate_by_direction[direction].append(0)
+
+            # Calculate averages here
+            avg_reward_by_direction = {d: np.mean(r) for d, r in total_reward_by_direction.items() if r}
+            avg_success_rate_by_direction = {d: np.mean(rates) for d, rates in success_rate_by_direction.items() if rates}
+
+            avg_reward_results[(num_nodes_sim, speed_sim, noise_level)] = avg_reward_by_direction
+            avg_success_rate_results[(num_nodes_sim, speed_sim, noise_level)] = avg_success_rate_by_direction
+            print(f"  Avg Reward by Direction: {avg_reward_by_direction}")
+            print(f"  Avg Success Rate by Direction: {avg_success_rate_by_direction}")
+
+
+            # Minimum Remaining Energy
+            energies = [node.energy for node in config.nodes]
+            min_energy = min(energies) if energies else 0
+            min_energy_results[(num_nodes_sim, speed_sim, noise_level)] = min_energy
+            print(f"  Minimum Remaining Energy: {min_energy:.2f}%")
+
+
+            # Maximum Hops Used
+            max_hops = 0
+            if Node.delivered_packets:
+                 hops_used = [p['hops_used'] for p in Node.delivered_packets if 'hops_used' in p]
+                 max_hops = max(hops_used) if hops_used else 0
+            max_hops_results[(num_nodes_sim, speed_sim, noise_level)] = max_hops
+            print(f"  Maximum Hops Used: {max_hops}")
+
+
+            # Average Initial and Final TTL
+            avg_initial_ttl = 0
+            avg_final_ttl = 0
+            if Node.delivered_packets:
+                initial_ttls = [p['initial_ttl'] for p in Node.delivered_packets if 'initial_ttl' in p]
+                final_ttls = [p['final_ttl'] for p in Node.delivered_packets if 'final_ttl' in p]
+                avg_initial_ttl = np.mean(initial_ttls) if initial_ttls else 0
+                avg_final_ttl = np.mean(final_ttls) if final_ttls else 0
+            avg_initial_ttl_results[(num_nodes_sim, speed_sim, noise_level)] = avg_initial_ttl
+            avg_final_ttl_results[(num_nodes_sim, speed_sim, noise_level)] = avg_final_ttl
+            print(f"  Avg Initial TTL: {avg_initial_ttl:.2f}")
+            print(f"  Avg Final TTL: {avg_final_ttl:.2f}")
+
+            # Store results using (num_nodes_sim, speed_sim, noise_level, src_dst_distance) as key, and also store src_dst_distance
+            key = (num_nodes_sim, speed_sim, noise_level, src_dst_distance)
+            # Use a tuple with noise_level and distance for all results
+            pdr_results[key] = pdr
+            e2e_delay_stats_results[key] = e2e_delay_stats if end_to_end_delays else None
+            throughput_results[key] = throughput_bps
+            avg_reward_results[key] = avg_reward_by_direction
+            avg_success_rate_results[key] = avg_success_rate_by_direction
+            min_energy_results[key] = min_energy
+            max_hops_results[key] = max_hops
+            avg_initial_ttl_results[key] = avg_initial_ttl
+            avg_final_ttl_results[key] = avg_final_ttl
+            simulation_duration_results[key] = simulation_duration
+
+            # --- CSV append for this simulation ---
+            with open(csv_results_path, mode='a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    num_nodes_sim,
+                    speed_sim,
+                    noise_level,
+                    src_dst_distance,
+                    pdr,
+                    e2e_delay_stats['mean'] if end_to_end_delays else None,
+                    e2e_delay_stats['50%'] if end_to_end_delays else None,
+                    e2e_delay_stats['std'] if end_to_end_delays else None,
+                    e2e_delay_stats['min'] if end_to_end_delays else None,
+                    e2e_delay_stats['max'] if end_to_end_delays else None,
+                    throughput_bps,
+                    avg_reward_by_direction.get(1, None),
+                    avg_reward_by_direction.get(0, None),
+                    avg_reward_by_direction.get(-1, None),
+                    avg_success_rate_by_direction.get(1, None),
+                    avg_success_rate_by_direction.get(0, None),
+                    avg_success_rate_by_direction.get(-1, None),
+                    min_energy,
+                    max_hops,
+                    avg_initial_ttl,
+                    avg_final_ttl,
+                    simulation_duration
+                ])
 
 print("\n--- Simulation Runs Complete ---")
 
 # Initialize a dictionary to hold the summarized metrics
 performance_metrics_summary = {}
 
-# Iterate through each (num_nodes, speed, distance) tuple that was simulated
+# Iterate through each (num_nodes, speed, noise_level, distance) tuple that was simulated
 for key in pdr_results.keys():
-    num_nodes, speed, src_dst_distance = key
+    num_nodes, speed, noise_level, src_dst_distance = key
     metrics_for_key = {}
 
     metrics_for_key['Src-Dst Distance (m)'] = src_dst_distance
@@ -1367,26 +1548,27 @@ for key in pdr_results.keys():
     metrics_for_key['Avg Initial TTL'] = avg_initial_ttl_results.get(key)
     metrics_for_key['Avg Final TTL'] = avg_final_ttl_results.get(key)
     metrics_for_key['Simulation Duration (s)'] = simulation_duration_results.get(key)
+    metrics_for_key['Noise Level'] = noise_level
 
-    # Use tuple (num_nodes, speed, src_dst_distance) as index
+    # Use tuple (num_nodes, speed, noise_level, src_dst_distance) as index
     performance_metrics_summary[key] = metrics_for_key
 
 # Convert the summary dictionary to a Pandas DataFrame for better visualization and analysis
 performance_summary_df = pd.DataFrame.from_dict(performance_metrics_summary, orient='index')
-performance_summary_df.index.names = ['Num Nodes', 'Speed (m/s)', 'Src-Dst Distance (m)']
+performance_summary_df.index.names = ['Num Nodes', 'Speed (m/s)', 'Noise Level', 'Src-Dst Distance (m)']
 
 # Save the summary DataFrame to CSV (append, for full summary)
 performance_summary_df.to_csv(csv_results_path, mode='a', header=True)
 
 # Display the summary DataFrame
-print("\n=== Performance Metrics Summary Across Speeds ===")
+print("\n=== Performance Metrics Summary Across Speeds and Noise Levels ===")
 print(performance_summary_df)
 
-# Print all metrics for each speed in a readable format
-print("\n=== Detailed Metrics for Each Speed ===")
-for speed in performance_summary_df.index:
-    print(f"\n--- Metrics for Speed {speed} m/s ---")
-    for metric, value in performance_summary_df.loc[speed].items():
+# Print all metrics for each speed and noise level in a readable format
+print("\n=== Detailed Metrics for Each Speed and Noise Level ===")
+for idx in performance_summary_df.index:
+    print(f"\n--- Metrics for Num Nodes {idx[0]}, Speed {idx[1]} m/s, Noise Level {idx[2]} ---")
+    for metric, value in performance_summary_df.loc[idx].items():
         print(f"{metric}: {value}")
 
 # Metrics to visualize as line plots
@@ -1414,54 +1596,77 @@ bar_plot_direction_metrics_success = [
     'Avg Success Rate Away (-1)'
 ]
 
-# --- Show individual graphs/charts for each metric ---
+# --- Show individual graphs/charts for each metric, grouped by noise level ---
 
-# 1. Line plots for each line metric
-print("\nGenerating Individual Line Plots for Each Metric:")
+# 1. Line plots for each line metric, grouped by noise level
+print("\nGenerating Individual Line Plots for Each Metric (grouped by Noise Level):")
 for metric in line_plot_metrics:
     if metric in performance_summary_df.columns:
-        y = performance_summary_df[metric].replace({None: np.nan})
         plt.figure(figsize=(8, 5))
-        plt.plot(performance_summary_df.index, y, marker='o', linestyle='-')
-        plt.xlabel("Node Speed (m/s)")
+        for noise_level in noise_levels:
+            # Filter rows for this noise level
+            df_noise = performance_summary_df[performance_summary_df['Noise Level'] == noise_level]
+            # Use Num Nodes or Speed as x-axis (choose one, here use Num Nodes)
+            x = df_noise.index.get_level_values('Num Nodes')
+            y = df_noise[metric].replace({None: np.nan})
+            plt.plot(x, y, marker='o', linestyle='-', label=f"Noise {noise_level}")
+        plt.xlabel("Num Nodes")
         plt.ylabel(metric)
-        plt.title(f"{metric} vs. Node Speed")
+        plt.title(f"{metric} vs. Num Nodes (by Noise Level)")
         plt.grid(True)
-        plt.xticks(performance_summary_df.index)
+        plt.legend()
         plt.tight_layout()
         plt.show()
     else:
         print(f"Metric '{metric}' not found in performance_summary_df.")
 
-# 2. Bar plots for each direction-based reward metric
-print("\nGenerating Individual Bar Plots for Direction-Based Reward Metrics:")
+# 2. Bar plots for each direction-based reward metric, grouped by noise level
+print("\nGenerating Individual Bar Plots for Direction-Based Reward Metrics (grouped by Noise Level):")
 for metric in bar_plot_direction_metrics_reward:
     if metric in performance_summary_df.columns:
-        y = performance_summary_df[metric].replace({None: np.nan})
         plt.figure(figsize=(8, 5))
-        plt.bar(performance_summary_df.index, y.fillna(0), width=0.6)
-        plt.xlabel("Node Speed (m/s)")
+        width = 0.18
+        x_vals = sorted(set(performance_summary_df.index.get_level_values('Num Nodes')))
+        for i, noise_level in enumerate(noise_levels):
+            df_noise = performance_summary_df[performance_summary_df['Noise Level'] == noise_level]
+            y = [df_noise[df_noise.index.get_level_values('Num Nodes') == x][metric].mean() for x in x_vals]
+            plt.bar([x + i*width for x in range(len(x_vals))], y, width=width, label=f"Noise {noise_level}")
+        plt.xlabel("Num Nodes")
         plt.ylabel(metric)
-        plt.title(f"{metric} vs. Node Speed")
+        plt.title(f"{metric} vs. Num Nodes (by Noise Level)")
         plt.grid(axis='y', alpha=0.75)
+        plt.xticks([x + width*(len(noise_levels)-1)/2 for x in range(len(x_vals))], x_vals)
+        plt.legend()
         plt.tight_layout()
         plt.show()
     else:
         print(f"Metric '{metric}' not found in performance_summary_df.")
 
-# 3. Bar plots for each direction-based success rate metric
-print("\nGenerating Individual Bar Plots for Direction-Based Success Rate Metrics:")
+# 3. Bar plots for each direction-based success rate metric, grouped by noise level
+print("\nGenerating Individual Bar Plots for Direction-Based Success Rate Metrics (grouped by Noise Level):")
 for metric in bar_plot_direction_metrics_success:
     if metric in performance_summary_df.columns:
-        y = performance_summary_df[metric].replace({None: np.nan})
         plt.figure(figsize=(8, 5))
-        plt.bar(performance_summary_df.index, y.fillna(0), width=0.6)
-        plt.xlabel("Node Speed (m/s)")
+        width = 0.18
+        x_vals = sorted(set(performance_summary_df.index.get_level_values('Num Nodes')))
+        for i, noise_level in enumerate(noise_levels):
+            df_noise = performance_summary_df[performance_summary_df['Noise Level'] == noise_level]
+            y = [df_noise[df_noise.index.get_level_values('Num Nodes') == x][metric].mean() for x in x_vals]
+            plt.bar([x + i*width for x in range(len(x_vals))], y, width=width, label=f"Noise {noise_level}")
+        plt.xlabel("Num Nodes")
         plt.ylabel(metric)
-        plt.title(f"{metric} vs. Node Speed")
+        plt.title(f"{metric} vs. Num Nodes (by Noise Level)")
         plt.ylim(0, 1.1)
         plt.grid(axis='y', alpha=0.75)
+        plt.xticks([x + width*(len(noise_levels)-1)/2 for x in range(len(x_vals))], x_vals)
+        plt.legend()
         plt.tight_layout()
         plt.show()
     else:
         print(f"Metric '{metric}' not found in performance_summary_df.")
+
+# Save the GNN weights after simulation
+GNN_WEIGHTS_PATH = "gnn_forward_agent_weights.pt"
+for node in config.nodes:
+    if hasattr(node, "gnn_agent") and node.gnn_agent is not None:
+        node.gnn_agent.save_weights()
