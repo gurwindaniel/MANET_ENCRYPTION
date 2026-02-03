@@ -115,32 +115,45 @@ class OnlineGNN:
 
     def online_update(self, feedback):
         """
-        Online update using real feedback.
-        feedback: dict {neighbor_id: reward/score}, e.g., 1 for successful delivery, 0 for fail.
+        Online GNN update using routing feedback
+        feedback: dict {neighbor_id: reward}
         """
-        if not self.neighbor_features or not feedback:
+        if not feedback:
             return
         if self.last_x is None or self.last_edge_index is None:
             return
+        if not hasattr(self, "last_id_to_idx"):
+            return
+
         x = self.last_x
         edge_index = self.last_edge_index
-        id_to_idx = {nid: i for i, nid in enumerate([self.node.node_id] + list(self.neighbor_features.keys()))}
-        targets = torch.zeros(x.size(0)).to(device) # Move tensor to device
-        for nid, val in feedback.items():
+        id_to_idx = self.last_id_to_idx
+
+        targets = torch.zeros(x.size(0), device=device)
+
+        for nid, reward in feedback.items():
             idx = id_to_idx.get(nid, None)
-            if idx is not None and idx < len(targets):
-                targets[idx] = val
+            if idx is not None and idx < targets.size(0):
+                targets[idx] = reward
+
+        # Training (gradients enabled)
+        self.gnn.train()
         pred = self.gnn(x, edge_index)
         loss = F.mse_loss(pred, targets)
+
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.gnn.parameters(), 1.0)
         self.optimizer.step()
+
+        self.gnn.eval()
 
     def mab_select_forwarder(self, candidates, dst_node=None):
         """UCB with much higher exploration and reward shaping. Only consider progress.
         --- TGNN integration: bias UCB using normalized predicted remaining link lifetime ---
         """
         self.total_mab_selections += 1
+        gnn_scores = self.compute_embeddings()  # {neighbor_id: score}
         ucb_scores = {}
         # --- Compute TGNN-based normalization parameters ---
         tgnn_lifetimes = []
@@ -158,12 +171,25 @@ class OnlineGNN:
             count = count + 1e-2
             reward = reward + 0.1
             avg_reward = reward / count
-            ucb = avg_reward + math.sqrt(128 * math.log(self.total_mab_selections + 1) / count)
+            # --- Standard UCB (proper exploration strength) ---
+            ucb = avg_reward + math.sqrt(
+                2 * math.log(self.total_mab_selections + 1) / count
+            )
+
+            # --- GNN bias (normalized) ---
+            gnn_score = np.tanh(gnn_scores.get(nid, 0.0))
+            ucb += 0.5 * gnn_score
+
+            # Small randomness
             ucb += random.uniform(0, 0.01)
-            # --- TGNN: bias UCB by predicted remaining link lifetime (normalized, small weight) ---
+
+            # --- TGNN lifetime gating ---
             pred_lifetime = self.node.tgnn_predict_link_lifetime(nid)
             if pred_lifetime is not None and np.isfinite(pred_lifetime):
-                ucb += 0.1 * norm(pred_lifetime)  # 0.1 is a small bias factor; tune as needed
+                if pred_lifetime < 1.0:
+                    ucb -= 2.0
+                else:
+                    ucb += 0.1 * norm(pred_lifetime)  # 0.1 is a small bias factor; tune as needed
             # Only allow progress neighbors if dst_node is given
             if dst_node is not None:
                 my_pos = np.array([self.node.x, self.node.y, self.node.z])
@@ -256,7 +282,7 @@ class Node:
         self.forwarding_queue = []  # Queue for multi-hop forwarding
         self.position_history = deque(maxlen=5) # Store own recent positions
         self.link_state_tracker = {} # Store state information for each neighbor
-        self.tgnn = TGNNLinkLifetime(feature_dim=8, hidden_dim=64, window=5).to(device)
+        self.tgnn = TGNNLinkLifetime(feature_dim=9, hidden_dim=64, window=5).to(device)
         self.tgnn_optimizer = torch.optim.Adam(self.tgnn.parameters(), lr=0.001)
         self.tgnn_history = {}  # neighbor_id: deque of feature vectors (window)
         self.tgnn_targets = []  # (features, edge_index_seq, target_remaining_lifetime)
@@ -832,26 +858,26 @@ if __name__ =="__main__":
     cumulative_optimal_reward = 0.0
 
     # --- Pre-training phase for GNN ---
-    pretrain_steps = 2000  # More pre-training
-    for _ in range(pretrain_steps):
-        mobility.step()
-        spatial_grid.assign_nodes(config.nodes)
-        for node in config.nodes:
-            node.gnn.update_neighbors()
-            feedback = {}
-            valid_neighbors = set(node.gnn.neighbor_features.keys())
-            for neighbor_id in valid_neighbors:
-                dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
-                my_pos = np.array([node.x, node.y, node.z])
-                dst_pos = np.array([dst.x, dst.y, dst.z])
-                neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
-                neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
-                feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
-            node.gnn.online_update(feedback)
-        # --- CTDG update for pretrain (optional, can skip if only main sim is tracked) ---
-        for node in config.nodes:
-            node.gnn.update_neighbors()
-        ctdg_tracker.update(_ * time_per_step_seconds)  # Use pretrain time
+    # pretrain_steps = 2000  # More pre-training
+    # for _ in range(pretrain_steps):
+    #     mobility.step()
+    #     spatial_grid.assign_nodes(config.nodes)
+    #     for node in config.nodes:
+    #         node.gnn.update_neighbors()
+    #         feedback = {}
+    #         valid_neighbors = set(node.gnn.neighbor_features.keys())
+    #         for neighbor_id in valid_neighbors:
+    #             dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
+    #             my_pos = np.array([node.x, node.y, node.z])
+    #             dst_pos = np.array([dst.x, dst.y, dst.z])
+    #             neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
+    #             neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
+    #             feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
+    #         node.gnn.online_update(feedback)
+    #     # --- CTDG update for pretrain (optional, can skip if only main sim is tracked) ---
+    #     for node in config.nodes:
+    #         node.gnn.update_neighbors()
+    #     ctdg_tracker.update(_ * time_per_step_seconds)  # Use pretrain time
 
     # --- Main simulation ---
     for step in range(steps):

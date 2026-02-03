@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set "VIRTUAL_ENV=D:\GURWIN\Research\011 Visual studio code\manet_routing\.venv"
+set "VIRTUAL_ENV=C:\Users\DELL\Documents\re\MANET_ENCRYPTION\.venv"
 
 if not defined PROMPT set PROMPT=$P$G
 
