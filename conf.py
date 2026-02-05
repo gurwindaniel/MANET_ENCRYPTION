@@ -167,6 +167,7 @@ class TemporalRouter:
         return max(0.0, min(1.0, quality))
 
     def select_forwarder(self, src, dst):
+
         src_pos = np.array([src.x, src.y, src.z])
         dst_pos = np.array([dst.x, dst.y, dst.z])
         src_dist = np.linalg.norm(src_pos - dst_pos)
@@ -355,7 +356,7 @@ class Packet:
         self.payload = payload
         self.hops = 0
 
-def simulate(nodes=80, steps=40, speed=50, noise_level=0.2, epsilon=0.1):
+def simulate(nodes=100, steps=40, speed=20, noise_level=0.0, epsilon=0.1):
     # Increased steps to 40, speed to 50 for more link break events
     obstacles = [
         Obstacle(500, 500, 500, 100),
