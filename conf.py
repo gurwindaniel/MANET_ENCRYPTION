@@ -16,37 +16,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
 from collections import deque
 import matplotlib.pyplot as plt
 
 DEVICE = torch.device("cpu")
 NEIGHBOR_RADIUS = 250  # Changed from 350 to 250
-
-# ================= TGNN: Link Lifetime Predictor =================
-class TGNNLinkLifetime(nn.Module):
-    def __init__(self, feature_dim=9, hidden_dim=64, window=3):  # window reduced from 5 to 3
-        super().__init__()
-        self.gcn1 = GCNConv(feature_dim, hidden_dim)
-        self.gcn2 = GCNConv(hidden_dim, hidden_dim)
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.window = window
-
-    def forward(self, x_seq, edge_index_seq):
-        outs = []
-        for t in range(self.window):
-            x_t = x_seq[t]
-            edge_t = edge_index_seq[t]
-            # Fix: If only one node, use self-loop edge index
-            if x_t.size(0) == 1:
-                edge_t = torch.tensor([[0],[0]], dtype=torch.long, device=x_t.device)
-            h = F.relu(self.gcn1(x_t, edge_t))
-            h = F.relu(self.gcn2(h, edge_t))
-            outs.append(h.unsqueeze(0))
-        hseq = torch.cat(outs, dim=0).permute(1, 0, 2)
-        out, _ = self.gru(hseq)
-        return self.fc(out[:, -1, :]).squeeze(-1)
 
 # ================= NODE =================
 class Node:
@@ -58,94 +32,11 @@ class Node:
         self.energy = 100.0
         self.queue = []
         self.pos_history = deque(maxlen=5)
-        self.link_hist = {}
-        self.tgnn_hist = {}
-        self.tgnn = TGNNLinkLifetime().to(DEVICE)
-        self.tgnn_optimizer = torch.optim.Adam(self.tgnn.parameters(), lr=1e-3)
-        self.tgnn_loss_fn = nn.MSELoss()
-        self.last_pred = {}  # nid -> (pred, t)
-        self.last_true = {}  # nid -> (true, t)
-        self.tgnn_losses = []  # Track TGNN loss for plotting
-        # Assign unique IP and MAC addresses
         self.ip = f"10.0.0.{node_id+1}"
         self.mac = f"00:00:00:00:00:{node_id:02x}"
 
     def update_position(self, t):
         self.pos_history.append((t, self.x, self.y, self.z))
-
-    def update_link(self, neighbor, t):
-        dx = neighbor.x - self.x
-        dy = neighbor.y - self.y
-        dz = neighbor.z - self.z
-        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-        if neighbor.node_id not in self.link_hist:
-            self.link_hist[neighbor.node_id] = deque(maxlen=3)  # window reduced to 3
-        self.link_hist[neighbor.node_id].append((t, dist))
-
-        feat = np.array([
-            dx, dy, dz,
-            0.0, 0.0, 0.0,
-            neighbor.energy,
-            t - self.link_hist[neighbor.node_id][0][0],
-            self.distance_trend(neighbor.node_id)
-        ], dtype=np.float32)
-
-        self.tgnn_hist.setdefault(neighbor.node_id, deque(maxlen=3)).append(feat)  # window reduced to 3
-        # Online learning: if enough history, predict and store pred/true for update
-        if len(self.tgnn_hist[neighbor.node_id]) == 3:
-            x_seq = torch.stack([torch.tensor(f, device=DEVICE).unsqueeze(0) for f in self.tgnn_hist[neighbor.node_id]])
-            # Fix: Always use valid edge indices for each time step
-            edge_list = []
-            for _ in range(3):
-                if x_seq[0].size(0) == 1:
-                    edge = torch.tensor([[0],[0]], dtype=torch.long, device=DEVICE)
-                else:
-                    edge = torch.tensor([[0,1],[1,0]], dtype=torch.long, device=DEVICE)
-                edge_list.append(edge)
-            with torch.no_grad():
-                pred = float(self.tgnn(x_seq, edge_list)[0])
-            self.last_pred[neighbor.node_id] = (pred, t)
-            # If previous prediction exists and link broke (distance > NEIGHBOR_RADIUS), update
-            if neighbor.node_id in self.link_hist and len(self.link_hist[neighbor.node_id]) >= 2:
-                prev_t, prev_dist = self.link_hist[neighbor.node_id][-2]
-                curr_t, curr_dist = self.link_hist[neighbor.node_id][-1]
-                # If link just broke (distance > NEIGHBOR_RADIUS), treat as ground truth
-                if prev_dist <= NEIGHBOR_RADIUS and curr_dist > NEIGHBOR_RADIUS:
-                    true_lifetime = curr_t - prev_t
-                    self.last_true[neighbor.node_id] = (true_lifetime, curr_t)
-                    pred_val = torch.tensor([pred], device=DEVICE)
-                    true_val = torch.tensor([true_lifetime], device=DEVICE)
-                    loss = self.tgnn_loss_fn(pred_val, true_val)
-                    self.tgnn_optimizer.zero_grad()
-                    loss.backward()
-                    self.tgnn_optimizer.step()
-                    self.tgnn_losses.append(loss.item())
-                    print(f"TGNN Online Loss (Node {self.node_id}, Link {neighbor.node_id}): {loss.item():.4f}")
-        # Remove: self.last_feats = best_feats
-        # Remove: return best
-
-    def distance_trend(self, nid):
-        h = self.link_hist.get(nid, None)
-        if h is None or len(h) < 2:
-            return 0.0
-        (t1, d1), (t0, d0) = h[-1], h[-2]
-        return (d1 - d0) / max(t1 - t0, 1e-3)
-
-    def predict_lifetime(self, nid):
-        hist = self.tgnn_hist.get(nid, None)
-        if hist and len(hist) == 3:
-            x_seq = torch.stack([torch.tensor(f).unsqueeze(0) for f in hist])
-            # Fix: Always use valid edge indices for each time step
-            edge_list = []
-            for _ in range(3):
-                if x_seq[0].size(0) == 1:
-                    edge = torch.tensor([[0],[0]], dtype=torch.long)
-                else:
-                    edge = torch.tensor([[0,1],[1,0]], dtype=torch.long)
-                edge_list.append(edge)
-            with torch.no_grad():
-                return float(self.tgnn(x_seq, edge_list)[0])
-        return 0.0
 
 # ================= TEMPORAL CONSISTENCY ROUTER (with real-world checks) =================
 class TemporalRouter:
@@ -160,6 +51,28 @@ class TemporalRouter:
         self.tc_losses = []  # Track TempReasoner loss for plotting
         self.epsilon = epsilon  # ϵ-greedy exploration parameter
 
+        # --- Improved: Deeper MLP for link quality prediction ---
+        self.history_window = 10  # Increased window for richer context
+        self.lq_input_dim = 10  # see _link_features
+        self.lq_hidden_dim = 16
+        self.lq_model = nn.Sequential(
+            nn.Linear(self.lq_input_dim, self.lq_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.lq_hidden_dim, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        ).to(DEVICE)
+        self.lq_optimizer = torch.optim.Adam(self.lq_model.parameters(), lr=5e-3)
+        self.lq_loss_fn = nn.MSELoss()
+        self.lq_train_data = []
+
+        self.link_hist = {}
+        self.last_pred = {}
+        self.last_true = {}
+        self.link_pred_quality = []
+        self.link_actual_duration = []
+
     def neighbors(self, node):
         nbrs = []
         for n in self.nodes:
@@ -170,13 +83,95 @@ class TemporalRouter:
                 nbrs.append(n)
         return nbrs
 
+    def update_link(self, src, neighbor, t):
+        # Maintain history for (src, neighbor)
+        dx = neighbor.x - src.x
+        dy = neighbor.y - src.y
+        dz = neighbor.z - src.z
+        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        key = (src.node_id, neighbor.node_id)
+        if key not in self.link_hist:
+            self.link_hist[key] = deque(maxlen=self.history_window)
+        self.link_hist[key].append((t, dist))
+        # Link break detection for metric
+        if len(self.link_hist[key]) >= 2:
+            prev_t, prev_dist = self.link_hist[key][-2]
+            curr_t, curr_dist = self.link_hist[key][-1]
+            if prev_dist <= NEIGHBOR_RADIUS and curr_dist > NEIGHBOR_RADIUS:
+                # Link just broke
+                duration = curr_t - prev_t
+                # Use the last predicted quality before break
+                pred_quality = self.predict_link_quality(src, neighbor)
+                self.link_pred_quality.append(pred_quality)
+                self.link_actual_duration.append(duration)
+                # --- Train MLP for several steps (mini-batch style) ---
+                feats = self._link_features(key, last_duration=duration)
+                duration_norm = duration / (self.history_window + 1e-6)
+                feats_torch = torch.tensor(feats, dtype=torch.float32, device=DEVICE)
+                target = torch.tensor([duration_norm], dtype=torch.float32, device=DEVICE)
+                for _ in range(5):
+                    pred = self.lq_model(feats_torch)
+                    loss = self.lq_loss_fn(pred, target)
+                    self.lq_optimizer.zero_grad()
+                    loss.backward()
+                    self.lq_optimizer.step()
+                # Optionally, print or store loss for debugging
+                # print(f"LinkPred Loss: {loss.item():.4f}")
+
+    def _link_features(self, key, last_duration=0.0):
+        hist = self.link_hist.get(key, None)
+        if not hist or len(hist) < 2:
+            return np.zeros(self.lq_input_dim, dtype=np.float32)
+        dists = np.array([d for (_, d) in hist])
+        times = np.array([t for (t, _) in hist])
+        avg_dist = np.mean(dists)
+        std_dist = np.std(dists)
+        min_dist = np.min(dists)
+        max_dist = np.max(dists)
+        t_norm = times - times[0]
+        if len(hist) >= 2:
+            A = np.vstack([t_norm, np.ones_like(t_norm)]).T
+            slope, _ = np.linalg.lstsq(A, dists, rcond=None)[0]
+            trends = [(dists[i] - dists[i-1]) / max(times[i] - times[i-1], 1e-3) for i in range(1, len(hist))]
+            mean_trend = np.mean(trends)
+            std_trend = np.std(trends)
+        else:
+            slope = 0.0
+            mean_trend = 0.0
+            std_trend = 0.0
+        last_change = 0.0
+        for i in range(len(dists)-1, 0, -1):
+            if abs(dists[i] - dists[i-1]) > 0.1 * avg_dist:
+                last_change = times[-1] - times[i]
+                break
+        count = float(len(hist))
+        last_duration_norm = float(last_duration) / (self.history_window + 1e-6)
+        feats = np.array([
+            avg_dist, std_dist, slope, min_dist, max_dist,
+            last_change, count, mean_trend, std_trend, last_duration_norm
+        ], dtype=np.float32)
+        feats[0:5] /= (NEIGHBOR_RADIUS + 1e-6)
+        feats[5] /= (self.history_window + 1e-6)
+        feats[6] /= self.history_window
+        feats[7:9] /= (NEIGHBOR_RADIUS + 1e-6)
+        # last_duration_norm is already normalized
+        return feats
+
+    def predict_link_quality(self, src, nbr):
+        key = (src.node_id, nbr.node_id)
+        feats = self._link_features(key)
+        feats_torch = torch.tensor(feats, dtype=torch.float32, device=DEVICE)
+        with torch.no_grad():
+            quality = self.lq_model(feats_torch).item()
+        # Clip to [0,1] for stability
+        return max(0.0, min(1.0, quality))
+
     def select_forwarder(self, src, dst):
         src_pos = np.array([src.x, src.y, src.z])
         dst_pos = np.array([dst.x, dst.y, dst.z])
         src_dist = np.linalg.norm(src_pos - dst_pos)
 
         nbrs = self.neighbors(src)
-        # Filter neighbors that make progress and pass MAC contention
         valid_nbrs = []
         feats_list = []
         scores = []
@@ -188,10 +183,10 @@ class TemporalRouter:
             if not mac_contention(src, nbrs):
                 continue
             progress = (src_dist - n_dist) / (src_dist + 1e-6)
-            lifetime = src.predict_lifetime(n.node_id)
-            stability = 1.0 / (1.0 + abs(src.distance_trend(n.node_id)))
+            link_quality = self.predict_link_quality(src, n)
+            stability = 1.0 / (1.0 + abs(self.distance_trend((src.node_id, n.node_id))))
             energy_term = n.energy / 100.0
-            feats = torch.tensor([progress, lifetime, stability, energy_term], dtype=torch.float32, device=DEVICE)
+            feats = torch.tensor([progress, link_quality, stability, energy_term], dtype=torch.float32, device=DEVICE)
             score = torch.dot(self.tc_weights, feats).item()
             valid_nbrs.append(n)
             feats_list.append(feats)
@@ -201,7 +196,6 @@ class TemporalRouter:
             self.last_feats = None
             return None
 
-        # ϵ-greedy: with probability epsilon, explore (random neighbor); else exploit (best score)
         if random.random() < self.epsilon:
             idx = random.randrange(len(valid_nbrs))
             best = valid_nbrs[idx]
@@ -215,7 +209,6 @@ class TemporalRouter:
         return best
 
     def online_update(self, reward):
-        # reward: +1 for delivery, -1 for failure, or function of hops
         if self.last_feats is not None:
             score = torch.dot(self.tc_weights, self.last_feats)
             loss = self.tc_loss_fn(reward, score)
@@ -224,6 +217,13 @@ class TemporalRouter:
             self.tc_optimizer.step()
             self.tc_losses.append(loss.item())
             print(f"TempReasoner Online Loss: {loss.item():.4f}")
+
+    def distance_trend(self, key):
+        h = self.link_hist.get(key, None)
+        if h is None or len(h) < 2:
+            return 0.0
+        (t1, d1), (t0, d0) = h[-1], h[-2]
+        return (d1 - d0) / max(t1 - t0, 1e-3)
 
 # ================= OBSTACLE MODEL =================
 class Obstacle:
@@ -369,7 +369,32 @@ def simulate(nodes=80, steps=40, speed=50, noise_level=0.2, epsilon=0.1):
     delivered_info = []  # (pkt, delivery_time, gen_time, hops)
     pkt_gen_time = {}    # (src_ip, dst_ip, payload) -> (gen_time, hops)
 
+    # --- Introduce sudden node shutdowns to force link breaks ---
+    shutdown_fraction = 0.1  # 10% of nodes will be shutdown
+    shutdown_count = max(1, int(len(nodes) * shutdown_fraction))
+    shutdown_nodes = random.sample(nodes, shutdown_count)
+    shutdown_step = random.randint(steps // 4, 3 * steps // 4)  # Shutdown at a random step in the middle
+
     for t in range(steps):
+        # Remove shutdown nodes at the shutdown step
+        if t == shutdown_step:
+            print(f"Shutting down nodes at step {t}: {[n.node_id for n in shutdown_nodes]}")
+            # Remove from nodes list
+            nodes = [n for n in nodes if n not in shutdown_nodes]
+            # Remove from mobility model
+            mobility.nodes = nodes
+            # Remove from router
+            router.nodes = nodes
+            # Forcibly break all links involving shutdown nodes
+            for n in shutdown_nodes:
+                for other in nodes:
+                    # Simulate link break for both directions
+                    router.update_link(n, other, t)
+                    router.update_link(other, n, t)
+            # Clear queues of shutdown nodes
+            for n in shutdown_nodes:
+                n.queue.clear()
+
         mobility.step(dt=1.0)
         for n in nodes:
             n.update_position(t)
@@ -379,8 +404,8 @@ def simulate(nodes=80, steps=40, speed=50, noise_level=0.2, epsilon=0.1):
             for n2 in nodes[i+1:]:
                 d = np.linalg.norm([n1.x-n2.x, n1.y-n2.y, n1.z-n2.z])
                 if d <= NEIGHBOR_RADIUS:
-                    n1.update_link(n2, t)
-                    n2.update_link(n1, t)
+                    router.update_link(n1, n2, t)
+                    router.update_link(n2, n1, t)
 
         # Generate packets: one per node per step
         for src in nodes:
@@ -470,24 +495,11 @@ def simulate(nodes=80, steps=40, speed=50, noise_level=0.2, epsilon=0.1):
         avg_delay = 0.0
         print("Average End-to-End Delay: N/A")
 
-    # --- Plot Losses ---
-    # Gather TGNN and TempReasoner losses
-    tgnn_losses = []
-    for n in nodes:
-        tgnn_losses.extend(n.tgnn_losses)
+    # --- Plot Losses, TempReasoner Parameters, and Link Prediction Metric ---
     tc_losses = router.tc_losses
 
-    plt.figure(figsize=(12,5))
-    plt.subplot(1,2,1)
-    if tgnn_losses:
-        plt.plot(tgnn_losses, label="TGNN Loss")
-        plt.xlabel("Update Step")
-        plt.ylabel("Loss")
-        plt.title("TGNN Online Loss")
-        plt.legend()
-    else:
-        plt.text(0.5, 0.5, "No TGNN Losses", ha='center', va='center')
-    plt.subplot(1,2,2)
+    plt.figure(figsize=(18,5))
+    plt.subplot(1,3,1)
     if tc_losses:
         plt.plot(tc_losses, label="TempReasoner Loss", color='orange')
         plt.xlabel("Update Step")
@@ -496,6 +508,27 @@ def simulate(nodes=80, steps=40, speed=50, noise_level=0.2, epsilon=0.1):
         plt.legend()
     else:
         plt.text(0.5, 0.5, "No TempReasoner Losses", ha='center', va='center')
+    plt.subplot(1,3,2)
+    # Plot TempReasoner learning parameters (weights)
+    weights = router.tc_weights.detach().cpu().numpy()
+    plt.bar(np.arange(len(weights)), weights, alpha=0.7, label="TC Weight Value")
+    plt.xlabel("Feature Index")
+    plt.ylabel("Weight Value")
+    plt.title("TempReasoner Weights")
+    plt.legend()
+    plt.subplot(1,3,3)
+    # Plot link prediction metric (correlation)
+    pred = np.array(router.link_pred_quality)
+    actual = np.array(router.link_actual_duration)
+    if len(pred) > 1 and len(actual) > 1:
+        corr = np.corrcoef(pred, actual)[0,1]
+        plt.scatter(pred, actual, alpha=0.5, label=f"Corr={corr:.2f}")
+        plt.xlabel("Predicted Link Quality at Break")
+        plt.ylabel("Actual Link Duration")
+        plt.title("Link Prediction Efficiency (Correlation)")
+        plt.legend()
+    else:
+        plt.text(0.5, 0.5, "Not enough link breaks", ha='center', va='center')
     plt.tight_layout()
     plt.show()
 
