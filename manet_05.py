@@ -115,45 +115,32 @@ class OnlineGNN:
 
     def online_update(self, feedback):
         """
-        Online GNN update using routing feedback
-        feedback: dict {neighbor_id: reward}
+        Online update using real feedback.
+        feedback: dict {neighbor_id: reward/score}, e.g., 1 for successful delivery, 0 for fail.
         """
-        if not feedback:
+        if not self.neighbor_features or not feedback:
             return
         if self.last_x is None or self.last_edge_index is None:
             return
-        if not hasattr(self, "last_id_to_idx"):
-            return
-
         x = self.last_x
         edge_index = self.last_edge_index
-        id_to_idx = self.last_id_to_idx
-
-        targets = torch.zeros(x.size(0), device=device)
-
-        for nid, reward in feedback.items():
+        id_to_idx = {nid: i for i, nid in enumerate([self.node.node_id] + list(self.neighbor_features.keys()))}
+        targets = torch.zeros(x.size(0)).to(device) # Move tensor to device
+        for nid, val in feedback.items():
             idx = id_to_idx.get(nid, None)
-            if idx is not None and idx < targets.size(0):
-                targets[idx] = reward
-
-        # Training (gradients enabled)
-        self.gnn.train()
+            if idx is not None and idx < len(targets):
+                targets[idx] = val
         pred = self.gnn(x, edge_index)
         loss = F.mse_loss(pred, targets)
-
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.gnn.parameters(), 1.0)
         self.optimizer.step()
-
-        self.gnn.eval()
 
     def mab_select_forwarder(self, candidates, dst_node=None):
         """UCB with much higher exploration and reward shaping. Only consider progress.
         --- TGNN integration: bias UCB using normalized predicted remaining link lifetime ---
         """
         self.total_mab_selections += 1
-        gnn_scores = self.compute_embeddings()  # {neighbor_id: score}
         ucb_scores = {}
         # --- Compute TGNN-based normalization parameters ---
         tgnn_lifetimes = []
@@ -171,25 +158,12 @@ class OnlineGNN:
             count = count + 1e-2
             reward = reward + 0.1
             avg_reward = reward / count
-            # --- Standard UCB (proper exploration strength) ---
-            ucb = avg_reward + math.sqrt(
-                2 * math.log(self.total_mab_selections + 1) / count
-            )
-
-            # --- GNN bias (normalized) ---
-            gnn_score = np.tanh(gnn_scores.get(nid, 0.0))
-            ucb += 0.5 * gnn_score
-
-            # Small randomness
+            ucb = avg_reward + math.sqrt(128 * math.log(self.total_mab_selections + 1) / count)
             ucb += random.uniform(0, 0.01)
-
-            # --- TGNN lifetime gating ---
+            # --- TGNN: bias UCB by predicted remaining link lifetime (normalized, small weight) ---
             pred_lifetime = self.node.tgnn_predict_link_lifetime(nid)
             if pred_lifetime is not None and np.isfinite(pred_lifetime):
-                if pred_lifetime < 1.0:
-                    ucb -= 2.0
-                else:
-                    ucb += 0.1 * norm(pred_lifetime)  # 0.1 is a small bias factor; tune as needed
+                ucb += 0.1 * norm(pred_lifetime)  # 0.1 is a small bias factor; tune as needed
             # Only allow progress neighbors if dst_node is given
             if dst_node is not None:
                 my_pos = np.array([self.node.x, self.node.y, self.node.z])
@@ -282,7 +256,7 @@ class Node:
         self.forwarding_queue = []  # Queue for multi-hop forwarding
         self.position_history = deque(maxlen=5) # Store own recent positions
         self.link_state_tracker = {} # Store state information for each neighbor
-        self.tgnn = TGNNLinkLifetime(feature_dim=9, hidden_dim=64, window=5).to(device)
+        self.tgnn = TGNNLinkLifetime(feature_dim=8, hidden_dim=64, window=5).to(device)
         self.tgnn_optimizer = torch.optim.Adam(self.tgnn.parameters(), lr=0.001)
         self.tgnn_history = {}  # neighbor_id: deque of feature vectors (window)
         self.tgnn_targets = []  # (features, edge_index_seq, target_remaining_lifetime)
@@ -537,16 +511,16 @@ class Node:
                     nid for nid in neighbor_scores
                     if np.linalg.norm(
                         np.array([
-                            next((n for n in config_nodes if n.node_id == nid), None).x,
-                            next((n for n in config_nodes if n.node_id == nid), None).y,
-                            next((n for n in config_nodes if n.node_id == nid), None).z
+                            next((n for n in config.nodes if n.node_id == nid), None).x,
+                            next((n for n in config.nodes if n.node_id == nid), None).y,
+                            next((n for n in config.nodes if n.node_id == nid), None).z
                         ]) - dst_pos
                     ) < np.linalg.norm(my_pos - dst_pos)
                 ]
                 if progress_candidates:
                     best_forwarder_id = self.gnn.mab_select_forwarder(progress_candidates, dst_node=dst_node)
                     if best_forwarder_id in self.gnn.neighbors:
-                        forwarder = next((n for n in config_nodes if n.node_id == best_forwarder_id), None)
+                        forwarder = next((n for n in config.nodes if n.node_id == best_forwarder_id), None)
                         if forwarder:
                             new_frame = self.construct_oppdata_frame(oppdata.dst_id, hops=hops+1, is_last_packet=oppdata.is_last_packet) # Pass is_last_packet
                             new_frame["payload"] = oppdata  # Preserve original data
@@ -826,342 +800,251 @@ class CTDGTracker:
                     events.append((node_id, neighbor_id, start, end))
         return events
 
+def inject_noise(delivered_packets, noise_level):
+    """Randomly drop a fraction of delivered packets to simulate noise."""
+    if noise_level <= 0.0:
+        return delivered_packets
+    keep_count = int((1.0 - noise_level) * len(delivered_packets))
+    if keep_count <= 0:
+        return []
+    return random.sample(delivered_packets, keep_count)
+
 if __name__ =="__main__":
-    config = Configuration(num_nodes=120)
-    mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=30)  # Increased speed
-    cell_size = 350  # Match neighbor radius
-    steps = 12  # Slightly more steps
-    packets_per_step = 120  # More packets per step
-    packet_size_bits = 8000 # 1KB packet size in bits
-    time_per_step_seconds = 0.1 # 0.1 seconds per simulation step
+    noise_levels = [0.1, 0.15, 0.25]
+    noise_results = {}
 
-    spatial_grid = SpatialGrid(cell_size)
+    for noise_level in noise_levels:
+        print(f"\n=== Running simulation with noise level: {noise_level} ===")
+        config = Configuration(num_nodes=120)
+        mobility = SteadyStateRandomWaypointMobility(config.nodes, speed=30)  # Increased speed
+        cell_size = 350  # Match neighbor radius
+        steps = 12  # Slightly more steps
+        packets_per_step = 120  # More packets per step
+        packet_size_bits = 8000 # 1KB packet size in bits
+        time_per_step_seconds = 0.1 # 0.1 seconds per simulation step
 
-    # --- CTDG tracker initialization ---
-    ctdg_tracker = CTDGTracker(config.nodes)
+        spatial_grid = SpatialGrid(cell_size)
+        ctdg_tracker = CTDGTracker(config.nodes)
 
-    # --- Metrics storage ---
-    pdr_list = []
-    throughput_list = []
-    delay_list = []
-    gnn_loss_list = []
-    mab_avg_reward_list = []
-    reward_list = []
-    cumulative_reward_list = []
-    regret_list = []
-    energy_consumption_list = []
-    routing_overhead_list = []
-    forwarding_attempts = 0  # Track actual forwarding attempts
+        pdr_list = []
+        throughput_list = []
+        gnn_loss_list = []
+        mab_avg_reward_list = []
+        reward_list = []
+        cumulative_reward_list = []
+        regret_list = []
+        energy_consumption_list = []
+        routing_overhead_list = []
+        forwarding_attempts = 0  # Track actual forwarding attempts
 
-    cumulative_reward = 0.0
-    optimal_reward_per_step = packets_per_step  # Assume optimal = all packets delivered (reward=1 per packet)
-    cumulative_optimal_reward = 0.0
+        cumulative_reward = 0.0
+        optimal_reward_per_step = packets_per_step  # Assume optimal = all packets delivered (reward=1 per packet)
+        cumulative_optimal_reward = 0.0
 
-    # --- Pre-training phase for GNN ---
-    # pretrain_steps = 2000  # More pre-training
-    # for _ in range(pretrain_steps):
-    #     mobility.step()
-    #     spatial_grid.assign_nodes(config.nodes)
-    #     for node in config.nodes:
-    #         node.gnn.update_neighbors()
-    #         feedback = {}
-    #         valid_neighbors = set(node.gnn.neighbor_features.keys())
-    #         for neighbor_id in valid_neighbors:
-    #             dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
-    #             my_pos = np.array([node.x, node.y, node.z])
-    #             dst_pos = np.array([dst.x, dst.y, dst.z])
-    #             neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
-    #             neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
-    #             feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
-    #         node.gnn.online_update(feedback)
-    #     # --- CTDG update for pretrain (optional, can skip if only main sim is tracked) ---
-    #     for node in config.nodes:
-    #         node.gnn.update_neighbors()
-    #     ctdg_tracker.update(_ * time_per_step_seconds)  # Use pretrain time
+        # # --- Pre-training phase for GNN ---
+        # pretrain_steps = 2000  # More pre-training
+        # for _ in range(pretrain_steps):
+        #     mobility.step()
+        #     spatial_grid.assign_nodes(config.nodes)
+        #     for node in config.nodes:
+        #         node.gnn.update_neighbors()
+        #         feedback = {}
+        #         valid_neighbors = set(node.gnn.neighbor_features.keys())
+        #         for neighbor_id in valid_neighbors:
+        #             dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
+        #             my_pos = np.array([node.x, node.y, node.z])
+        #             dst_pos = np.array([dst.x, dst.y, dst.z])
+        #             neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
+        #             neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
+        #             feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
+        #         node.gnn.online_update(feedback)
+        #     # --- CTDG update for pretrain (optional, can skip if only main sim is tracked) ---
+        #     for node in config.nodes:
+        #         node.gnn.update_neighbors()
+        #     ctdg_tracker.update(_ * time_per_step_seconds)  # Use pretrain time
 
-    # --- Main simulation ---
-    for step in range(steps):
-        current_time = step * time_per_step_seconds # Assign a continuous time value
-        mobility.step()
-        spatial_grid.assign_nodes(config.nodes)
+        # --- Main simulation ---
+        for step in range(steps):
+            current_time = step * time_per_step_seconds # Assign a continuous time value
+            mobility.step()
+            spatial_grid.assign_nodes(config.nodes)
 
-        for node in config.nodes:
-            node.update_position_history(current_time) # Update node's own position history
+            for node in config.nodes:
+                node.update_position_history(current_time) # Update node's own position history
 
-        for sender in config.nodes:
-            frame = sender.construct_frame()
-            receivers = spatial_grid.get_receivers(sender, sender.gnn.neighbor_radius)
-            current_neighbors_ids = {r.node_id for r in receivers} # Get current neighbors for link tracking
-            sender.update_link_state_tracker(current_time, current_neighbors_ids, config.nodes)
+            for sender in config.nodes:
+                frame = sender.construct_frame()
+                receivers = spatial_grid.get_receivers(sender, sender.gnn.neighbor_radius)
+                current_neighbors_ids = {r.node_id for r in receivers} # Get current neighbors for link tracking
+                sender.update_link_state_tracker(current_time, current_neighbors_ids, config.nodes)
 
-        # --- Online TGNN training step for each node ---
-        tgnn_losses = []
-        for node in config.nodes:
-            loss = node.tgnn_train_step()
-            if loss is not None:
-                tgnn_losses.append(loss)
-        # Optionally, you can log tgnn_losses if desired
+            # --- Online TGNN training step for each node ---
+            tgnn_losses = []
+            for node in config.nodes:
+                loss = node.tgnn_train_step()
+                if loss is not None:
+                    tgnn_losses.append(loss)
+            # Optionally, you can log tgnn_losses if desired
 
-        # --- CTDG update ---
-        for node in config.nodes:
-            node.gnn.update_neighbors()
-        ctdg_tracker.update(current_time)
-
-        # --- GNN performance metric: average MSE loss per node per step ---
-        gnn_losses = []
-        for node in config.nodes:
-            node.gnn.update_neighbors()
-            feedback = {}
-            valid_neighbors = set(node.gnn.neighbor_features.keys())
-            for neighbor_id in valid_neighbors:
-                dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
-                my_pos = np.array([node.x, node.y, node.z])
-                dst_pos = np.array([dst.x, dst.y, dst.z])
-                neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
-                neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
-                feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
-
-            # --- Compute and store GNN loss ---
-            if node.gnn.neighbor_features:
-                x, edge_index, id_to_idx = node.gnn._build_graph()
-                targets = torch.zeros(x.size(0)).to(device) # Move tensor to device
-                for nid, val in feedback.items():
-                    idx = id_to_idx.get(nid, None)
-                    if idx is not None and idx < len(targets):
-                        targets[idx] = val
-                with torch.no_grad():
-                    pred = node.gnn.gnn(x, edge_index)
-                    loss = F.mse_loss(pred, targets)
-                    gnn_losses.append(loss.item())
-            node.gnn.online_update(feedback)
-        gnn_loss_list.append(np.mean(gnn_losses) if gnn_losses else 0.0)
-
-        # --- Data packet delivery ---
-        delivered_packets = []
-        packet_delays = []
-        packet_sent_time = {}
-        packet_hop_count = {}  # Track hops for each packet
-        for _ in range(packets_per_step):
-            src, dst = random.sample(config.nodes, 2)
-            is_last = random.random() < 0.1
-            opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0, is_last_packet=is_last)
-            src.forwarding_queue.append(opp_frame)
-            packet_key = (src.node_id, dst.node_id, is_last)
-            packet_sent_time[packet_key] = current_time
-            packet_hop_count[packet_key] = 0
-
-        # --- Forwarding with energy consumption and forwarding attempt tracking ---
-        for node in config.nodes:
-            new_queue = []
-            for frame in node.forwarding_queue:
-                oppdata = frame["payload"]
-                hops = frame.get("hops", 0)
-                packet_key = (oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet)
-                # --- Ensure packet_hop_count and packet_sent_time are initialized for forwarded packets ---
-                if packet_key not in packet_sent_time:
-                    packet_sent_time[packet_key] = current_time
-                if packet_key not in packet_hop_count:
-                    packet_hop_count[packet_key] = hops
-                if hops >= 50:
-                    continue  # Drop packet if max hops exceeded
-                if node.receive_oppdata_frame(frame):
-                    delivered_packets.append((oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet))
-                    # Delay calculation will use packet_sent_time below
-                    continue
+            # --- CTDG update ---
+            for node in config.nodes:
                 node.gnn.update_neighbors()
-                neighbor_scores = node.gnn.compute_embeddings()
-                if neighbor_scores:
-                    dst_node = next((n for n in config.nodes if n.node_id == oppdata.dst_id), None)
+            ctdg_tracker.update(current_time)
+
+            # --- GNN performance metric: average MSE loss per node per step ---
+            gnn_losses = []
+            for node in config.nodes:
+                node.gnn.update_neighbors()
+                feedback = {}
+                valid_neighbors = set(node.gnn.neighbor_features.keys())
+                for neighbor_id in valid_neighbors:
+                    dst = random.choice([n for n in config.nodes if n.node_id != node.node_id])
                     my_pos = np.array([node.x, node.y, node.z])
-                    dst_pos = np.array([dst_node.x, dst_node.y, dst_node.z])
-                    progress_candidates = [
-                        nid for nid in neighbor_scores
-                        if np.linalg.norm(
-                            np.array([
-                                next((n for n in config.nodes if n.node_id == nid), None).x,
-                                next((n for n in config.nodes if n.node_id == nid), None).y,
-                                next((n for n in config.nodes if n.node_id == nid), None).z
-                            ]) - dst_pos
-                        ) < np.linalg.norm(my_pos - dst_pos)
-                    ]
-                    if progress_candidates:
-                        best_forwarder_id = node.gnn.mab_select_forwarder(progress_candidates, dst_node=dst_node)
-                        if best_forwarder_id in node.gnn.neighbors:
-                            forwarder = next((n for n in config.nodes if n.node_id == best_forwarder_id), None)
-                            if forwarder:
-                                new_frame = node.construct_oppdata_frame(oppdata.dst_id, hops=hops+1, is_last_packet=oppdata.is_last_packet)
-                                new_frame["payload"] = oppdata  # Preserve original data
-                                # --- Propagate packet_key metadata to forwarded packet ---
-                                forwarder.forwarding_queue.append(new_frame)
-                                node.energy -= 0.01  # Transmission cost (tune as needed)
-                                forwarder.energy -= 0.005  # Reception cost (tune as needed)
-                                forwarding_attempts += 1
-                                packet_hop_count[packet_key] += 1
-                                reward = 1.0 if forwarder.node_id == oppdata.dst_id else 0.0
-                                node.gnn.mab_update(
-                                    best_forwarder_id, reward,
-                                    src_node=node,
-                                    dst_node=dst_node,
-                                    forwarder_node=forwarder
-                                )
+                    dst_pos = np.array([dst.x, dst.y, dst.z])
+                    neighbor = next((n for n in config.nodes if n.node_id == neighbor_id), None)
+                    neighbor_pos = np.array([neighbor.x, neighbor.y, neighbor.z])
+                    feedback[neighbor_id] = 1.0 if np.linalg.norm(neighbor_pos - dst_pos) < np.linalg.norm(my_pos - dst_pos) else 0.0
+
+                # --- Compute and store GNN loss ---
+                if node.gnn.neighbor_features:
+                    x, edge_index, id_to_idx = node.gnn._build_graph()
+                    targets = torch.zeros(x.size(0)).to(device) # Move tensor to device
+                    for nid, val in feedback.items():
+                        idx = id_to_idx.get(nid, None)
+                        if idx is not None and idx < len(targets):
+                            targets[idx] = val
+                    with torch.no_grad():
+                        pred = node.gnn.gnn(x, edge_index)
+                        loss = F.mse_loss(pred, targets)
+                        gnn_losses.append(loss.item())
+                node.gnn.online_update(feedback)
+            gnn_loss_list.append(np.mean(gnn_losses) if gnn_losses else 0.0)
+
+            # --- Data packet delivery ---
+            delivered_packets = []
+            packet_delays = []
+            packet_sent_time = {}
+            packet_hop_count = {}  # Track hops for each packet
+            for _ in range(packets_per_step):
+                src, dst = random.sample(config.nodes, 2)
+                is_last = random.random() < 0.1
+                opp_frame = src.construct_oppdata_frame(dst.node_id, hops=0, is_last_packet=is_last)
+                src.forwarding_queue.append(opp_frame)
+                packet_key = (src.node_id, dst.node_id, is_last)
+                packet_sent_time[packet_key] = current_time
+                packet_hop_count[packet_key] = 0
+
+            # --- Forwarding with energy consumption and forwarding attempt tracking ---
+            for node in config.nodes:
+                new_queue = []
+                for frame in node.forwarding_queue:
+                    oppdata = frame["payload"]
+                    hops = frame.get("hops", 0)
+                    packet_key = (oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet)
+                    if packet_key not in packet_sent_time:
+                        packet_sent_time[packet_key] = current_time
+                    if packet_key not in packet_hop_count:
+                        packet_hop_count[packet_key] = hops
+                    if hops >= 50:
+                        continue  # Drop packet if max hops exceeded
+                    if node.receive_oppdata_frame(frame):
+                        delivered_packets.append((oppdata.src_id, oppdata.dst_id, oppdata.is_last_packet))
+                        continue
+                    node.gnn.update_neighbors()
+                    neighbor_scores = node.gnn.compute_embeddings()
+                    if neighbor_scores:
+                        dst_node = next((n for n in config.nodes if n.node_id == oppdata.dst_id), None)
+                        my_pos = np.array([node.x, node.y, node.z])
+                        dst_pos = np.array([dst_node.x, dst_node.y, dst_node.z])
+                        progress_candidates = [
+                            nid for nid in neighbor_scores
+                            if np.linalg.norm(
+                                np.array([
+                                    next((n for n in config.nodes if n.node_id == nid), None).x,
+                                    next((n for n in config.nodes if n.node_id == nid), None).y,
+                                    next((n for n in config.nodes if n.node_id == nid), None).z
+                                ]) - dst_pos
+                            ) < np.linalg.norm(my_pos - dst_pos)
+                        ]
+                        if progress_candidates:
+                            best_forwarder_id = node.gnn.mab_select_forwarder(progress_candidates, dst_node=dst_node)
+                            if best_forwarder_id in node.gnn.neighbors:
+                                forwarder = next((n for n in config.nodes if n.node_id == best_forwarder_id), None)
+                                if forwarder:
+                                    new_frame = node.construct_oppdata_frame(oppdata.dst_id, hops=hops+1, is_last_packet=oppdata.is_last_packet)
+                                    new_frame["payload"] = oppdata  # Preserve original data
+                                    forwarder.forwarding_queue.append(new_frame)
+                                    node.energy -= 0.01  # Transmission cost (tune as needed)
+                                    forwarder.energy -= 0.005  # Reception cost (tune as needed)
+                                    forwarding_attempts += 1
+                                    packet_hop_count[packet_key] += 1
+                                    reward = 1.0 if forwarder.node_id == oppdata.dst_id else 0.0
+                                    node.gnn.mab_update(
+                                        best_forwarder_id, reward,
+                                        src_node=node,
+                                        dst_node=dst_node,
+                                        forwarder_node=forwarder
+                                    )
+                                else:
+                                    new_queue.append(frame)
                             else:
                                 new_queue.append(frame)
                         else:
                             new_queue.append(frame)
                     else:
                         new_queue.append(frame)
-                else:
-                    new_queue.append(frame)
-            node.forwarding_queue = new_queue
+                node.forwarding_queue = new_queue
 
-        # --- End-to-end delay calculation (use true send time) ---
-        for src_id, dst_id, is_last_packet in delivered_packets:
-            packet_key = (src_id, dst_id, is_last_packet)
-            sent_time = packet_sent_time.get(packet_key, current_time)
-            delay = current_time - sent_time + time_per_step_seconds
-            # If delivered in the same step, delay = time_per_step_seconds; if multi-hop, delay increases
-            delay += (packet_hop_count.get(packet_key, 0) * time_per_step_seconds)
-            packet_delays.append(delay)
-        avg_delay_per_sec = (np.mean(packet_delays) / time_per_step_seconds) if packet_delays else 0.0
-        delay_list.append(avg_delay_per_sec)
+            # --- Inject noise here ---
+            delivered_packets_noisy = inject_noise(delivered_packets, noise_level)
 
-        # --- Throughput calculation (Mbps) ---
-        throughput_mbps = (len(delivered_packets) * packet_size_bits) / (time_per_step_seconds * 1e6)
-        throughput_list.append(throughput_mbps)
+            # --- Throughput and PDR ---
+            throughput_mbps = (len(delivered_packets_noisy) * packet_size_bits) / (time_per_step_seconds * 1e6)
+            throughput_list.append(throughput_mbps)
+            pdr = len(delivered_packets_noisy) / packets_per_step if packets_per_step > 0 else 0.0
+            pdr_list.append(pdr)
 
-        # --- PDR calculation (packets received / packets transmitted) ---
-        pdr = len(delivered_packets) / packets_per_step if packets_per_step > 0 else 0.0
-        pdr_list.append(pdr)
+            print(f"Step {step} (noise={noise_level}): PDR = {len(delivered_packets_noisy)}/{packets_per_step} ({pdr:.2f}), Throughput = {throughput_mbps:.3f} Mbps")
 
-        # --- Reward, Cumulative Reward, Regret ---
-        # Reward: average reward per step (MAB)
-        mab_rewards = []
-        total_step_reward = 0.0
-        for node in config.nodes:
-            if node.gnn.mab_counts:
-                rewards = [node.gnn.mab_rewards.get(nid, 0) / node.gnn.mab_counts.get(nid, 1) for nid in node.gnn.mab_counts]
-                mab_rewards.extend(rewards)
-                total_step_reward += sum([node.gnn.mab_rewards.get(nid, 0) for nid in node.gnn.mab_counts])
-        avg_reward = np.mean(mab_rewards) if mab_rewards else 0.0
-        reward_list.append(avg_reward)
-        mab_avg_reward_list.append(avg_reward)
+        avg_pdr = np.mean(pdr_list)
+        avg_throughput = np.mean(throughput_list)
+        noise_results[noise_level] = {
+            "pdr_list": pdr_list,
+            "throughput_list": throughput_list,
+            "avg_pdr": avg_pdr,
+            "avg_throughput": avg_throughput
+        }
+        print(f"=== Noise {noise_level}: Avg PDR = {avg_pdr:.3f}, Avg Throughput = {avg_throughput:.3f} Mbps ===")
 
-        # --- Regret calculation: use delivered packets as actual reward ---
-        cumulative_reward += len(delivered_packets)
-        cumulative_optimal_reward += optimal_reward_per_step
-        regret = cumulative_optimal_reward - cumulative_reward
-        regret = max(regret, 0.0)  # Ensure non-negative
-        cumulative_reward_list.append(cumulative_reward)
-        regret_list.append(regret)
+    # --- Print summary table ---
+    print("\n=== Summary of PDR and Throughput for Different Noise Levels ===")
+    for noise_level in noise_levels:
+        print(f"Noise {noise_level}: Avg PDR = {noise_results[noise_level]['avg_pdr']:.3f}, "
+              f"Avg Throughput = {noise_results[noise_level]['avg_throughput']:.3f} Mbps")
 
-        # --- Energy Consumption ---
-        total_energy = sum([100.0 - node.energy for node in config.nodes])  # Now reflects actual consumption
-        energy_consumption_list.append(total_energy)
-
-        # --- Routing Overhead: use actual forwarding attempts ---
-        routing_overhead = (forwarding_attempts / len(delivered_packets)) if delivered_packets else 0.0
-        routing_overhead_list.append(routing_overhead)
-        forwarding_attempts = 0  # Reset for next step
-
-        # --- GNN loss already calculated ---
-        # --- Print step metrics ---
-        print(f"Step {step}: "
-              f"PDR = {len(delivered_packets)}/{packets_per_step} ({pdr:.2f}), "
-              f"Throughput = {throughput_mbps:.3f} Mbps, "
-              f"Avg End-to-End Delay = {avg_delay_per_sec:.3f} s, "
-              f"GNN Loss = {gnn_loss_list[-1]:.4f}, "
-              f"MAB Avg Reward = {avg_reward:.3f}, "
-              f"Cumulative Reward = {cumulative_reward:.2f}, Regret = {regret:.2f}, "
-              f"Energy Consumption = {total_energy:.2f}, Routing Overhead = {routing_overhead:.2f}")
-        print("="*60)
-
-    # --- Print overall metrics after all steps ---
-    total_packets_sent = packets_per_step * steps
-    total_packets_received = int(np.sum(np.array(pdr_list) * packets_per_step))
-    avg_pdr = total_packets_received / total_packets_sent if total_packets_sent > 0 else 0.0
-    print(f"Overall PDR: {total_packets_received}/{total_packets_sent} ({avg_pdr:.2f})")
-    print(f"Average Throughput: {np.mean(throughput_list):.3f} Mbps")
-    print(f"Average End-to-End Delay per Second: {np.mean(delay_list):.3f} s")
-    print(f"Average GNN Loss: {np.mean(gnn_loss_list):.6f}")
-    print(f"Average MAB Reward: {np.mean(mab_avg_reward_list):.6f}")
-    print(f"Final Cumulative Reward: {cumulative_reward:.2f}")
-    print(f"Final Regret: {regret_list[-1]:.2f}")
-    print(f"Final Energy Consumption: {energy_consumption_list[-1]:.2f}")
-    print(f"Final Routing Overhead: {routing_overhead_list[-1]:.2f}")
-
-    # --- Plotting metrics ---
+    # --- Optionally, plot PDR and Throughput for each noise level ---
+    import matplotlib.pyplot as plt
+    import seaborn as sns
     sns.set(style="whitegrid")
     steps_range = range(steps)
 
     plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=pdr_list, marker='o')
-    plt.title("Packet Delivery Ratio (PDR) per Step")
+    for noise_level in noise_levels:
+        plt.plot(steps_range, noise_results[noise_level]["pdr_list"], marker='o', label=f"Noise {noise_level}")
+    plt.title("Packet Delivery Ratio (PDR) per Step (with Noise)")
     plt.xlabel("Step")
-    plt.ylabel("PDR (Packets Received / Packets Sent)")
+    plt.ylabel("PDR")
     plt.ylim(0, 1.05)
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
     plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=throughput_list, marker='o', color='orange')
-    plt.title("Throughput per Step")
+    for noise_level in noise_levels:
+        plt.plot(steps_range, noise_results[noise_level]["throughput_list"], marker='o', label=f"Noise {noise_level}")
+    plt.title("Throughput per Step (with Noise)")
     plt.xlabel("Step")
     plt.ylabel("Throughput (Mbps)")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=delay_list, marker='o', color='green')
-    plt.title("Average End-to-End Delay per Second")
-    plt.xlabel("Step")
-    plt.ylabel("Delay (seconds)")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=gnn_loss_list, marker='o', color='red')
-    plt.title("GNN Performance: Average MSE Loss per Step")
-    plt.xlabel("Step")
-    plt.ylabel("MSE Loss")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=reward_list, marker='o', color='purple')
-    plt.title("MAB Performance: Average Reward per Step")
-    plt.xlabel("Step")
-    plt.ylabel("Average Reward")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=cumulative_reward_list, marker='o', color='blue')
-    plt.title("Cumulative Reward per Step")
-    plt.xlabel("Step")
-    plt.ylabel("Cumulative Reward")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=regret_list, marker='o', color='black')
-    plt.title("Regret per Step")
-    plt.xlabel("Step")
-    plt.ylabel("Regret")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=energy_consumption_list, marker='o', color='teal')
-    plt.title("Energy Consumption per Step")
-    plt.xlabel("Step")
-    plt.ylabel("Total Energy Consumed")
-    plt.tight_layout()
-    plt.show()
-
-    plt.figure(figsize=(7,4))
-    sns.lineplot(x=steps_range, y=routing_overhead_list, marker='o', color='magenta')
-    plt.title("Routing Overhead per Step")
-    plt.xlabel("Step")
-    plt.ylabel("Routing Overhead (Forwarding Attempts / Delivered Packets)")
+    plt.legend()
     plt.tight_layout()
     plt.show()
