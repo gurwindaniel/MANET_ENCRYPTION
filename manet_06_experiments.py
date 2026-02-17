@@ -139,12 +139,16 @@ class NeighborTrackingAgent:
             dist = np.linalg.norm(self.node.position - other.position)
             if dist <= self.comm_range:
                 self.neighbors.append(other.node_id)
-                metrics = self._compute_neighbor_metrics(other, dist, dt)
-                self.neighbor_metrics[other.node_id] = metrics
-                self.node.agent_b.update_contact_history(other.node_id, current_time, True)
-            else:
-                if other.node_id in self.neighbor_metrics:
-                    self.node.agent_b.update_contact_history(other.node_id, current_time, False)
+                # Simplified metrics calculation
+                rel_speed = np.linalg.norm(other.velocity - self.node.velocity) if hasattr(other, 'velocity') else 0
+                self.neighbor_metrics[other.node_id] = {
+                    'distance': dist,
+                    'relative_speed': rel_speed,
+                    'approach_rate': 0.0,
+                    'link_stability': 1.0 / (1.0 + rel_speed * 0.1),
+                    'contact_duration': max(10, (self.comm_range - dist) / (rel_speed + 0.1)),
+                    'direction_to_other': np.zeros(2)
+                }
         return self.neighbors
 
     def _compute_neighbor_metrics(self, other_node, dist, dt):
@@ -384,13 +388,13 @@ def update_node_positions(nodes, dt=1.0):
         node.move(dt=dt)
 
 
-def run_single_experiment(n_nodes, node_speed, num_steps=100):
+def run_single_experiment(n_nodes, node_speed, num_steps=50):
     """Run a single experiment with given node count and speed."""
     # Scale area with node count for consistent density
-    area_size = int(np.sqrt(n_nodes) * 80)  # Slightly smaller area for density
-    comm_range = int(area_size * 0.35)  # Increased range for connectivity
+    area_size = int(np.sqrt(n_nodes) * 70)  # Smaller area for speed
+    comm_range = int(area_size * 0.4)  # Higher range for connectivity
     
-    agent_dims = {'a_in': 8, 'a_hidden': 32, 'b_in': 8, 'b_hidden': 32}  # Smaller for speed
+    agent_dims = {'a_in': 8, 'a_hidden': 16, 'b_in': 8, 'b_hidden': 16}  # Minimal for speed
     fusion_weights = {'alpha': 1.5, 'beta': 2.5, 'gamma': 2.0, 'delta': 0.3}
     
     nodes = [
@@ -404,8 +408,8 @@ def run_single_experiment(n_nodes, node_speed, num_steps=100):
     PACKET_SIZE_BYTES = 8192
     PACKET_SIZE_BITS = PACKET_SIZE_BYTES * 8
     packet_counter = 0
-    FORWARDING_ROUNDS = 2  # Reduced for speed
-    MAX_PACKETS_PER_CONTACT = 3  # Reduced for speed
+    FORWARDING_ROUNDS = 1  # Single round for speed
+    MAX_PACKETS_PER_CONTACT = 2  # Minimal for speed
     
     for t in range(num_steps):
         update_node_positions(nodes)
@@ -520,7 +524,7 @@ def run_all_experiments():
     """Run experiments for all node counts and speeds."""
     node_counts = [100, 200, 300, 400, 500]
     speeds = [20, 25, 30, 35, 40]
-    num_steps = 100  # Reduced steps for faster execution
+    num_steps = 50  # Reduced for faster execution
     
     # Results storage
     results = {
