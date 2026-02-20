@@ -388,11 +388,20 @@ def update_node_positions(nodes, dt=1.0):
         node.move(dt=dt)
 
 
-def run_single_experiment(n_nodes, node_speed, num_steps=50):
-    """Run a single experiment with given node count and speed."""
+def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
+    """Run a single experiment with given node count, speed, and noise level.
+    
+    Args:
+        noise_level: Channel noise level (0.0 to 1.0). Higher noise causes:
+            - Packet drops during forwarding (link-layer loss)
+            - Reduced link quality / effective communication range
+            - Increased delay from failed transmissions
+    """
     # Scale area with node count for consistent density
     area_size = int(np.sqrt(n_nodes) * 70)  # Smaller area for speed
-    comm_range = int(area_size * 0.4)  # Higher range for connectivity
+    # Noise reduces effective communication range
+    base_comm_range = int(area_size * 0.4)
+    comm_range = int(base_comm_range * (1.0 - noise_level * 0.3))  # Up to 30% range reduction
     
     agent_dims = {'a_in': 8, 'a_hidden': 16, 'b_in': 8, 'b_hidden': 16}  # Minimal for speed
     fusion_weights = {'alpha': 1.5, 'beta': 2.5, 'gamma': 2.0, 'delta': 0.3}
@@ -458,6 +467,14 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50):
                     for candidate_id, score in candidates:
                         candidate_node = nodes[candidate_id]
                         
+                        # Apply noise: random packet drop based on noise level
+                        if random.random() < noise_level:
+                            # Packet lost due to channel noise
+                            node.record_delivery_result(candidate_id, False)
+                            rewards = {'a': -0.2, 'b': -0.2, 'c': -0.2, 'd': 0.1}
+                            node.update_agents(rewards, candidate_id)
+                            continue  # Try next candidate
+                        
                         if candidate_id == packet.dst:
                             packet.hops.append(candidate_id)
                             packet.delivered = True
@@ -521,162 +538,220 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50):
 
 
 def run_all_experiments():
-    """Run experiments for all node counts and speeds."""
+    """Run experiments for all node counts, speeds, and noise levels."""
     node_counts = [100, 200, 300, 400, 500]
     speeds = [20, 25, 30, 35, 40]
+    noise_levels = [0.0, 0.1, 0.15, 0.2]
     num_steps = 50  # Reduced for faster execution
     
-    # Results storage
+    # Results storage: indexed by [node_count, speed, noise_level]
     results = {
-        'pdr': np.zeros((len(node_counts), len(speeds))),
-        'delay': np.zeros((len(node_counts), len(speeds))),
-        'throughput': np.zeros((len(node_counts), len(speeds))),
-        'hops': np.zeros((len(node_counts), len(speeds)))
+        'pdr': np.zeros((len(node_counts), len(speeds), len(noise_levels))),
+        'delay': np.zeros((len(node_counts), len(speeds), len(noise_levels))),
+        'throughput': np.zeros((len(node_counts), len(speeds), len(noise_levels))),
+        'hops': np.zeros((len(node_counts), len(speeds), len(noise_levels)))
     }
     
-    total_experiments = len(node_counts) * len(speeds)
+    total_experiments = len(node_counts) * len(speeds) * len(noise_levels)
     current = 0
     
-    print("=" * 70)
+    print("=" * 80)
     print("MANET OPPORTUNISTIC ROUTING - MULTI-CONFIGURATION EXPERIMENTS")
-    print("=" * 70)
+    print("=" * 80)
     print(f"Node counts: {node_counts}")
     print(f"Speeds: {speeds}")
+    print(f"Noise levels: {noise_levels}")
     print(f"Steps per experiment: {num_steps}")
-    print("-" * 70)
+    print("-" * 80)
     
     for i, n_nodes in enumerate(node_counts):
         for j, speed in enumerate(speeds):
-            current += 1
-            print(f"\n[{current}/{total_experiments}] Running: Nodes={n_nodes}, Speed={speed} m/s")
-            
-            start_time = time.time()
-            result = run_single_experiment(n_nodes, speed, num_steps)
-            elapsed = time.time() - start_time
-            
-            results['pdr'][i, j] = result['pdr']
-            results['delay'][i, j] = result['delay']
-            results['throughput'][i, j] = result['throughput']
-            results['hops'][i, j] = result['hops']
-            
-            print(f"   PDR: {result['pdr']:.3f} | Delay: {result['delay']:.3f}s | "
-                  f"Throughput: {result['throughput']:.4f} Mbps | Hops: {result['hops']:.2f} | "
-                  f"Time: {elapsed:.1f}s")
+            for k, noise in enumerate(noise_levels):
+                current += 1
+                print(f"\n[{current}/{total_experiments}] Running: Nodes={n_nodes}, "
+                      f"Speed={speed} m/s, Noise={noise}")
+                
+                start_time = time.time()
+                result = run_single_experiment(n_nodes, speed, num_steps, noise_level=noise)
+                elapsed = time.time() - start_time
+                
+                results['pdr'][i, j, k] = result['pdr']
+                results['delay'][i, j, k] = result['delay']
+                results['throughput'][i, j, k] = result['throughput']
+                results['hops'][i, j, k] = result['hops']
+                
+                print(f"   PDR: {result['pdr']:.3f} | Delay: {result['delay']:.3f}s | "
+                      f"Throughput: {result['throughput']:.4f} Mbps | Hops: {result['hops']:.2f} | "
+                      f"Time: {elapsed:.1f}s")
     
-    return results, node_counts, speeds
+    return results, node_counts, speeds, noise_levels
 
 
-def plot_results(results, node_counts, speeds):
+def plot_results(results, node_counts, speeds, noise_levels):
     """Create comprehensive visualization of results."""
     
-    # Create figure with 2x3 subplots
-    fig = plt.figure(figsize=(18, 12))
+    # =========================================================================
+    # FIGURE 1: Metrics vs Number of Nodes (averaged over speeds, per noise)
+    # =========================================================================
+    fig1, axes1 = plt.subplots(2, 2, figsize=(16, 12))
     
-    colors = plt.cm.viridis(np.linspace(0, 1, len(speeds)))
-    markers = ['o', 's', '^', 'D', 'v']
+    noise_colors = ['#2ecc71', '#3498db', '#e67e22', '#e74c3c']
+    noise_markers = ['o', 's', '^', 'D']
     
-    # ===== Plot 1: PDR vs Number of Nodes =====
-    ax1 = fig.add_subplot(2, 3, 1)
-    for j, speed in enumerate(speeds):
-        ax1.plot(node_counts, results['pdr'][:, j], 
-                marker=markers[j], color=colors[j], linewidth=2, markersize=8,
-                label=f'Speed={speed} m/s')
-    ax1.set_xlabel('Number of Nodes', fontsize=12)
-    ax1.set_ylabel('Packet Delivery Ratio (PDR)', fontsize=12)
-    ax1.set_title('PDR vs Number of Nodes', fontsize=14, fontweight='bold')
-    ax1.legend(loc='best', fontsize=9)
-    ax1.grid(True, linestyle='--', alpha=0.7)
-    ax1.set_ylim(0, 1.05)
+    # Average over speeds (axis=1) -> shape: [node_counts, noise_levels]
+    pdr_avg = results['pdr'].mean(axis=1)
+    delay_avg = results['delay'].mean(axis=1)
+    throughput_avg = results['throughput'].mean(axis=1)
+    hops_avg = results['hops'].mean(axis=1)
     
-    # ===== Plot 2: Delay vs Number of Nodes =====
-    ax2 = fig.add_subplot(2, 3, 2)
-    for j, speed in enumerate(speeds):
-        ax2.plot(node_counts, results['delay'][:, j], 
-                marker=markers[j], color=colors[j], linewidth=2, markersize=8,
-                label=f'Speed={speed} m/s')
-    ax2.set_xlabel('Number of Nodes', fontsize=12)
-    ax2.set_ylabel('Average Delay (seconds)', fontsize=12)
-    ax2.set_title('Delay vs Number of Nodes', fontsize=14, fontweight='bold')
-    ax2.legend(loc='best', fontsize=9)
-    ax2.grid(True, linestyle='--', alpha=0.7)
+    # PDR vs Nodes
+    ax = axes1[0, 0]
+    for k, noise in enumerate(noise_levels):
+        ax.plot(node_counts, pdr_avg[:, k], marker=noise_markers[k], color=noise_colors[k],
+                linewidth=2, markersize=8, label=f'Noise={noise}')
+    ax.set_xlabel('Number of Nodes', fontsize=12)
+    ax.set_ylabel('Packet Delivery Ratio (PDR)', fontsize=12)
+    ax.set_title('PDR vs Number of Nodes', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    ax.set_ylim(0, 1.05)
     
-    # ===== Plot 3: Throughput vs Number of Nodes =====
-    ax3 = fig.add_subplot(2, 3, 3)
-    for j, speed in enumerate(speeds):
-        ax3.plot(node_counts, results['throughput'][:, j], 
-                marker=markers[j], color=colors[j], linewidth=2, markersize=8,
-                label=f'Speed={speed} m/s')
-    ax3.set_xlabel('Number of Nodes', fontsize=12)
-    ax3.set_ylabel('Throughput (Mbps)', fontsize=12)
-    ax3.set_title('Throughput vs Number of Nodes', fontsize=14, fontweight='bold')
-    ax3.legend(loc='best', fontsize=9)
-    ax3.grid(True, linestyle='--', alpha=0.7)
+    # Delay vs Nodes
+    ax = axes1[0, 1]
+    for k, noise in enumerate(noise_levels):
+        ax.plot(node_counts, delay_avg[:, k], marker=noise_markers[k], color=noise_colors[k],
+                linewidth=2, markersize=8, label=f'Noise={noise}')
+    ax.set_xlabel('Number of Nodes', fontsize=12)
+    ax.set_ylabel('Average Delay (seconds)', fontsize=12)
+    ax.set_title('Delay vs Number of Nodes', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.7)
     
-    # ===== Plot 4: Hops vs Number of Nodes =====
-    ax4 = fig.add_subplot(2, 3, 4)
-    for j, speed in enumerate(speeds):
-        ax4.plot(node_counts, results['hops'][:, j], 
-                marker=markers[j], color=colors[j], linewidth=2, markersize=8,
-                label=f'Speed={speed} m/s')
-    ax4.set_xlabel('Number of Nodes', fontsize=12)
-    ax4.set_ylabel('Average Hop Count', fontsize=12)
-    ax4.set_title('Hop Count vs Number of Nodes', fontsize=14, fontweight='bold')
-    ax4.legend(loc='best', fontsize=9)
-    ax4.grid(True, linestyle='--', alpha=0.7)
+    # Throughput vs Nodes
+    ax = axes1[1, 0]
+    for k, noise in enumerate(noise_levels):
+        ax.plot(node_counts, throughput_avg[:, k], marker=noise_markers[k], color=noise_colors[k],
+                linewidth=2, markersize=8, label=f'Noise={noise}')
+    ax.set_xlabel('Number of Nodes', fontsize=12)
+    ax.set_ylabel('Throughput (Mbps)', fontsize=12)
+    ax.set_title('Throughput vs Number of Nodes', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.7)
     
-    # ===== Plot 5: PDR Heatmap =====
-    ax5 = fig.add_subplot(2, 3, 5)
-    im = ax5.imshow(results['pdr'], cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
-    ax5.set_xticks(range(len(speeds)))
-    ax5.set_xticklabels(speeds)
-    ax5.set_yticks(range(len(node_counts)))
-    ax5.set_yticklabels(node_counts)
-    ax5.set_xlabel('Speed (m/s)', fontsize=12)
-    ax5.set_ylabel('Number of Nodes', fontsize=12)
-    ax5.set_title('PDR Heatmap', fontsize=14, fontweight='bold')
-    plt.colorbar(im, ax=ax5, label='PDR')
-    # Add text annotations
-    for i in range(len(node_counts)):
-        for j in range(len(speeds)):
-            text = ax5.text(j, i, f'{results["pdr"][i, j]:.2f}',
-                          ha='center', va='center', color='black', fontsize=10)
+    # Hops vs Nodes
+    ax = axes1[1, 1]
+    for k, noise in enumerate(noise_levels):
+        ax.plot(node_counts, hops_avg[:, k], marker=noise_markers[k], color=noise_colors[k],
+                linewidth=2, markersize=8, label=f'Noise={noise}')
+    ax.set_xlabel('Number of Nodes', fontsize=12)
+    ax.set_ylabel('Average Hop Count', fontsize=12)
+    ax.set_title('Hop Count vs Number of Nodes', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.7)
     
-    # ===== Plot 6: Throughput Heatmap =====
-    ax6 = fig.add_subplot(2, 3, 6)
-    im2 = ax6.imshow(results['throughput'], cmap='YlOrRd', aspect='auto')
-    ax6.set_xticks(range(len(speeds)))
-    ax6.set_xticklabels(speeds)
-    ax6.set_yticks(range(len(node_counts)))
-    ax6.set_yticklabels(node_counts)
-    ax6.set_xlabel('Speed (m/s)', fontsize=12)
-    ax6.set_ylabel('Number of Nodes', fontsize=12)
-    ax6.set_title('Throughput Heatmap (Mbps)', fontsize=14, fontweight='bold')
-    plt.colorbar(im2, ax=ax6, label='Throughput (Mbps)')
-    # Add text annotations
-    for i in range(len(node_counts)):
-        for j in range(len(speeds)):
-            text = ax6.text(j, i, f'{results["throughput"][i, j]:.3f}',
-                          ha='center', va='center', color='black', fontsize=9)
-    
-    plt.suptitle('MANET Opportunistic Routing: Performance Analysis\n(TGNN + Multi-Agent)', 
-                fontsize=16, fontweight='bold', y=1.02)
+    fig1.suptitle('MANET Performance vs Node Count (Averaged Over Speeds)\nEffect of Channel Noise',
+                  fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('manet_experiments_results.png', dpi=150, bbox_inches='tight')
+    fig1.savefig('manet_noise_vs_nodes.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("\nResults saved to 'manet_experiments_results.png'")
+    print("Saved: manet_noise_vs_nodes.png")
     
-    # Additional: Create separate bar charts
-    create_bar_charts(results, node_counts, speeds)
+    # =========================================================================
+    # FIGURE 2: Metrics vs Noise Level (averaged over node counts, per speed)
+    # =========================================================================
+    fig2, axes2 = plt.subplots(2, 2, figsize=(16, 12))
+    
+    speed_colors = plt.cm.plasma(np.linspace(0.1, 0.9, len(speeds)))
+    speed_markers = ['o', 's', '^', 'D', 'v']
+    
+    # Average over node counts (axis=0) -> shape: [speeds, noise_levels]
+    pdr_avg_n = results['pdr'].mean(axis=0)
+    delay_avg_n = results['delay'].mean(axis=0)
+    throughput_avg_n = results['throughput'].mean(axis=0)
+    hops_avg_n = results['hops'].mean(axis=0)
+    
+    metric_configs = [
+        (pdr_avg_n, 'PDR', 'Packet Delivery Ratio', axes2[0, 0]),
+        (delay_avg_n, 'Delay', 'Average Delay (s)', axes2[0, 1]),
+        (throughput_avg_n, 'Throughput', 'Throughput (Mbps)', axes2[1, 0]),
+        (hops_avg_n, 'Hops', 'Average Hop Count', axes2[1, 1]),
+    ]
+    
+    for data, metric_name, ylabel, ax in metric_configs:
+        for j, speed in enumerate(speeds):
+            ax.plot(noise_levels, data[j, :], marker=speed_markers[j], color=speed_colors[j],
+                    linewidth=2, markersize=8, label=f'Speed={speed} m/s')
+        ax.set_xlabel('Noise Level', fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(f'{metric_name} vs Noise Level', fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.set_xticks(noise_levels)
+    
+    fig2.suptitle('MANET Performance vs Noise Level (Averaged Over Node Counts)\nEffect of Speed',
+                  fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    fig2.savefig('manet_noise_vs_speed.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Saved: manet_noise_vs_speed.png")
+    
+    # =========================================================================
+    # FIGURE 3: PDR & Throughput Heatmaps for each noise level
+    # =========================================================================
+    fig3, axes3 = plt.subplots(2, len(noise_levels), figsize=(5 * len(noise_levels), 10))
+    
+    for k, noise in enumerate(noise_levels):
+        # PDR Heatmap (top row)
+        ax = axes3[0, k]
+        im = ax.imshow(results['pdr'][:, :, k], cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+        ax.set_xticks(range(len(speeds)))
+        ax.set_xticklabels(speeds)
+        ax.set_yticks(range(len(node_counts)))
+        ax.set_yticklabels(node_counts)
+        ax.set_xlabel('Speed (m/s)', fontsize=10)
+        ax.set_ylabel('Nodes', fontsize=10)
+        ax.set_title(f'PDR (Noise={noise})', fontsize=12, fontweight='bold')
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        for i in range(len(node_counts)):
+            for j in range(len(speeds)):
+                ax.text(j, i, f'{results["pdr"][i, j, k]:.2f}',
+                        ha='center', va='center', color='black', fontsize=8)
+        
+        # Throughput Heatmap (bottom row)
+        ax = axes3[1, k]
+        im2 = ax.imshow(results['throughput'][:, :, k], cmap='YlOrRd', aspect='auto')
+        ax.set_xticks(range(len(speeds)))
+        ax.set_xticklabels(speeds)
+        ax.set_yticks(range(len(node_counts)))
+        ax.set_yticklabels(node_counts)
+        ax.set_xlabel('Speed (m/s)', fontsize=10)
+        ax.set_ylabel('Nodes', fontsize=10)
+        ax.set_title(f'Throughput (Noise={noise})', fontsize=12, fontweight='bold')
+        plt.colorbar(im2, ax=ax, shrink=0.8)
+        for i in range(len(node_counts)):
+            for j in range(len(speeds)):
+                ax.text(j, i, f'{results["throughput"][i, j, k]:.3f}',
+                        ha='center', va='center', color='black', fontsize=7)
+    
+    fig3.suptitle('PDR & Throughput Heatmaps Across Noise Levels', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    fig3.savefig('manet_noise_heatmaps.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Saved: manet_noise_heatmaps.png")
+    
+    # Create bar charts
+    create_bar_charts(results, node_counts, speeds, noise_levels)
 
 
-def create_bar_charts(results, node_counts, speeds):
-    """Create grouped bar charts for each metric."""
+def create_bar_charts(results, node_counts, speeds, noise_levels):
+    """Create grouped bar charts: metrics vs noise level for each node count."""
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    x = np.arange(len(node_counts))
+    x = np.arange(len(noise_levels))
     width = 0.15
-    colors = ['#2ecc71', '#3498db', '#9b59b6', '#e74c3c', '#f39c12']
+    node_colors = ['#2ecc71', '#3498db', '#9b59b6', '#e74c3c', '#f39c12']
     
+    # Average over speeds (axis=1) -> shape: [node_counts, noise_levels]
     metrics = [
         ('pdr', 'Packet Delivery Ratio', axes[0, 0]),
         ('delay', 'Average Delay (s)', axes[0, 1]),
@@ -685,80 +760,96 @@ def create_bar_charts(results, node_counts, speeds):
     ]
     
     for metric_key, metric_name, ax in metrics:
-        for j, speed in enumerate(speeds):
-            offset = (j - len(speeds)/2 + 0.5) * width
-            bars = ax.bar(x + offset, results[metric_key][:, j], width, 
-                         label=f'{speed} m/s', color=colors[j], edgecolor='black', linewidth=0.5)
+        data_avg = results[metric_key].mean(axis=1)  # avg over speeds
+        for i, n_nodes in enumerate(node_counts):
+            offset = (i - len(node_counts)/2 + 0.5) * width
+            ax.bar(x + offset, data_avg[i, :], width,
+                   label=f'{n_nodes} nodes', color=node_colors[i], edgecolor='black', linewidth=0.5)
         
-        ax.set_xlabel('Number of Nodes', fontsize=12)
+        ax.set_xlabel('Noise Level', fontsize=12)
         ax.set_ylabel(metric_name, fontsize=12)
-        ax.set_title(f'{metric_name} by Node Count and Speed', fontsize=14, fontweight='bold')
+        ax.set_title(f'{metric_name} vs Noise Level', fontsize=14, fontweight='bold')
         ax.set_xticks(x)
-        ax.set_xticklabels(node_counts)
-        ax.legend(title='Speed', fontsize=9)
+        ax.set_xticklabels([str(n) for n in noise_levels])
+        ax.legend(title='Nodes', fontsize=9)
         ax.grid(True, axis='y', linestyle='--', alpha=0.7)
     
-    plt.suptitle('MANET Performance Metrics: Grouped Bar Charts', fontsize=16, fontweight='bold')
+    plt.suptitle('MANET Performance vs Noise: Grouped Bar Charts (Avg Over Speeds)',
+                 fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('manet_experiments_barcharts.png', dpi=150, bbox_inches='tight')
+    plt.savefig('manet_noise_barcharts.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("Bar charts saved to 'manet_experiments_barcharts.png'")
+    print("Saved: manet_noise_barcharts.png")
 
 
-def print_summary_table(results, node_counts, speeds):
-    """Print a formatted summary table."""
+def print_summary_table(results, node_counts, speeds, noise_levels):
+    """Print a formatted summary table for each noise level."""
+    
+    for k, noise in enumerate(noise_levels):
+        print("\n" + "=" * 90)
+        print(f"EXPERIMENT RESULTS SUMMARY  —  Noise Level = {noise}")
+        print("=" * 90)
+        
+        # PDR Table
+        print("\n--- Packet Delivery Ratio (PDR) ---")
+        print(f"{'Nodes':<10}", end="")
+        for speed in speeds:
+            print(f"{speed} m/s".center(12), end="")
+        print()
+        print("-" * 70)
+        for i, n_nodes in enumerate(node_counts):
+            print(f"{n_nodes:<10}", end="")
+            for j in range(len(speeds)):
+                print(f"{results['pdr'][i, j, k]:.3f}".center(12), end="")
+            print()
+        
+        # Delay Table
+        print("\n--- Average Delay (seconds) ---")
+        print(f"{'Nodes':<10}", end="")
+        for speed in speeds:
+            print(f"{speed} m/s".center(12), end="")
+        print()
+        print("-" * 70)
+        for i, n_nodes in enumerate(node_counts):
+            print(f"{n_nodes:<10}", end="")
+            for j in range(len(speeds)):
+                print(f"{results['delay'][i, j, k]:.3f}".center(12), end="")
+            print()
+        
+        # Throughput Table
+        print("\n--- Throughput (Mbps) ---")
+        print(f"{'Nodes':<10}", end="")
+        for speed in speeds:
+            print(f"{speed} m/s".center(12), end="")
+        print()
+        print("-" * 70)
+        for i, n_nodes in enumerate(node_counts):
+            print(f"{n_nodes:<10}", end="")
+            for j in range(len(speeds)):
+                print(f"{results['throughput'][i, j, k]:.4f}".center(12), end="")
+            print()
+    
+    # Noise comparison summary (averaged over all nodes and speeds)
     print("\n" + "=" * 90)
-    print("EXPERIMENT RESULTS SUMMARY")
+    print("NOISE IMPACT SUMMARY (Averaged over all node counts and speeds)")
     print("=" * 90)
-    
-    # PDR Table
-    print("\n--- Packet Delivery Ratio (PDR) ---")
-    print(f"{'Nodes':<10}", end="")
-    for speed in speeds:
-        print(f"{speed} m/s".center(12), end="")
-    print()
-    print("-" * 70)
-    for i, n_nodes in enumerate(node_counts):
-        print(f"{n_nodes:<10}", end="")
-        for j in range(len(speeds)):
-            print(f"{results['pdr'][i, j]:.3f}".center(12), end="")
-        print()
-    
-    # Delay Table
-    print("\n--- Average Delay (seconds) ---")
-    print(f"{'Nodes':<10}", end="")
-    for speed in speeds:
-        print(f"{speed} m/s".center(12), end="")
-    print()
-    print("-" * 70)
-    for i, n_nodes in enumerate(node_counts):
-        print(f"{n_nodes:<10}", end="")
-        for j in range(len(speeds)):
-            print(f"{results['delay'][i, j]:.3f}".center(12), end="")
-        print()
-    
-    # Throughput Table
-    print("\n--- Throughput (Mbps) ---")
-    print(f"{'Nodes':<10}", end="")
-    for speed in speeds:
-        print(f"{speed} m/s".center(12), end="")
-    print()
-    print("-" * 70)
-    for i, n_nodes in enumerate(node_counts):
-        print(f"{n_nodes:<10}", end="")
-        for j in range(len(speeds)):
-            print(f"{results['throughput'][i, j]:.4f}".center(12), end="")
-        print()
-    
-    print("\n" + "=" * 90)
+    print(f"{'Noise':<10}{'PDR':>10}{'Delay (s)':>12}{'Throughput':>14}{'Hops':>10}")
+    print("-" * 56)
+    for k, noise in enumerate(noise_levels):
+        avg_pdr = results['pdr'][:, :, k].mean()
+        avg_delay = results['delay'][:, :, k].mean()
+        avg_tp = results['throughput'][:, :, k].mean()
+        avg_hops = results['hops'][:, :, k].mean()
+        print(f"{noise:<10}{avg_pdr:>10.4f}{avg_delay:>12.3f}{avg_tp:>14.4f}{avg_hops:>10.2f}")
+    print("=" * 90)
 
 
 if __name__ == "__main__":
     # Run all experiments
-    results, node_counts, speeds = run_all_experiments()
+    results, node_counts, speeds, noise_levels = run_all_experiments()
     
     # Print summary table
-    print_summary_table(results, node_counts, speeds)
+    print_summary_table(results, node_counts, speeds, noise_levels)
     
     # Plot results
-    plot_results(results, node_counts, speeds)
+    plot_results(results, node_counts, speeds, noise_levels)
