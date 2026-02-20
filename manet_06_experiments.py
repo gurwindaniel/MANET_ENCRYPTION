@@ -399,9 +399,8 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
     """
     # Scale area with node count for consistent density
     area_size = int(np.sqrt(n_nodes) * 70)  # Smaller area for speed
-    # Noise reduces effective communication range
-    base_comm_range = int(area_size * 0.4)
-    comm_range = int(base_comm_range * (1.0 - noise_level * 0.3))  # Up to 30% range reduction
+    # Use fixed communication range (e.g., 250 meters)
+    comm_range = 250
     
     agent_dims = {'a_in': 8, 'a_hidden': 16, 'b_in': 8, 'b_hidden': 16}  # Minimal for speed
     fusion_weights = {'alpha': 1.5, 'beta': 2.5, 'gamma': 2.0, 'delta': 0.3}
@@ -539,7 +538,7 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
 
 def run_all_experiments():
     """Run experiments for all node counts, speeds, and noise levels."""
-    node_counts = [100, 200, 300, 400, 500]
+    node_counts = [100]
     speeds = [20, 25, 30, 35, 40]
     noise_levels = [0.0, 0.1, 0.15, 0.2]
     num_steps = 50  # Reduced for faster execution
