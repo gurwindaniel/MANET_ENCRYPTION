@@ -538,7 +538,7 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
 
 def run_all_experiments():
     """Run experiments for all node counts, speeds, and noise levels."""
-    node_counts = [100]
+    node_counts = [200]
     speeds = [20, 25, 30, 35, 40]
     noise_levels = [0.0, 0.1, 0.15, 0.2]
     num_steps = 50  # Reduced for faster execution
