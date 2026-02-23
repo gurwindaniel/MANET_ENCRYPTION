@@ -23,13 +23,17 @@ warnings.filterwarnings('ignore')
 class ReliabilityAgent(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.gnn = GCNConv(input_dim, hidden_dim)
+        self.gnn1 = GCNConv(input_dim, hidden_dim)
+        self.gnn2 = GCNConv(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.activation = nn.LeakyReLU(0.2)
         self.fc = nn.Linear(hidden_dim, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        h = self.gnn(x, edge_index)
+        h = self.activation(self.gnn1(x, edge_index))
+        h = self.norm(h + self.activation(self.gnn2(h, edge_index)))  # residual + norm
         out = self.fc(h)
         return self.sigmoid(out).squeeze(-1)
 
@@ -38,12 +42,15 @@ class ReliabilityAgent(nn.Module):
 
 
 class CandidateForwarderTGNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers=3):
+    def __init__(self, input_dim, hidden_dim, num_layers=5):
         super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)  # project input to hidden_dim for residual
         self.temporal_gnn = GatedGraphConv(out_channels=hidden_dim, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.activation = nn.LeakyReLU(0.2)
         self.attention = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim // 2, 1)
         )
         self.fc_priority = nn.Linear(hidden_dim, 1)
@@ -52,7 +59,9 @@ class CandidateForwarderTGNN(nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
+        x_proj = self.input_proj(x)
         h = self.temporal_gnn(x, edge_index)
+        h = self.norm(self.activation(h) + x_proj)  # residual skip connection + LayerNorm
         attention_weights = self.sigmoid(self.attention(h))
         priority_scores = self.sigmoid(self.fc_priority(h)).squeeze(-1)
         return priority_scores * attention_weights.squeeze(-1)
@@ -73,15 +82,15 @@ class CandidateForwarderTGNN(nn.Module):
 class ThroughputAgent:
     def __init__(self, max_neighbors):
         self.q_values = {}
-        self.alpha = 0.3
+        self.alpha = 0.5  # Faster adaptation for throughput learning
 
     def forward(self, context, neighbor_ids):
         throughput_score = 1.0 / (1.0 + context[:, 0])
-        throughput_score += context[:, 1]
-        throughput_score += context[:, 2] * 0.1
+        throughput_score += context[:, 1] * 1.5  # Weight success ratio higher
+        throughput_score += context[:, 2] * 0.2  # Slightly higher energy factor
         for i, nid in enumerate(neighbor_ids):
             if nid in self.q_values:
-                throughput_score[i] += self.q_values[nid] * 0.5
+                throughput_score[i] += self.q_values[nid] * 0.8  # Stronger learned bias
         return throughput_score
 
     def update(self, neighbor_id, reward):
@@ -97,7 +106,7 @@ class ExplorationAgent:
         self.counts = {}
         self.values = {}
         self.total_count = 0
-        self.ucb_c = 1.5
+        self.ucb_c = 0.8  # Lower exploration constant to reduce unnecessary hops
 
     def forward(self, neighbor_ids):
         n_neighbors = len(neighbor_ids)
@@ -131,24 +140,31 @@ class NeighborTrackingAgent:
         self.neighbors = []
         self.neighbor_metrics = {}
 
-    def update_neighbors(self, all_nodes, current_time, dt=1.0):
+    def update_neighbors(self, all_nodes, current_time, noise_level=0.0, dt=1.0):
         self.neighbors = []
         for other in all_nodes:
             if other.node_id == self.node.node_id:
                 continue
             dist = np.linalg.norm(self.node.position - other.position)
-            if dist <= self.comm_range:
-                self.neighbors.append(other.node_id)
-                # Simplified metrics calculation
-                rel_speed = np.linalg.norm(other.velocity - self.node.velocity) if hasattr(other, 'velocity') else 0
-                self.neighbor_metrics[other.node_id] = {
-                    'distance': dist,
-                    'relative_speed': rel_speed,
-                    'approach_rate': 0.0,
-                    'link_stability': 1.0 / (1.0 + rel_speed * 0.1),
-                    'contact_duration': max(10, (self.comm_range - dist) / (rel_speed + 0.1)),
-                    'direction_to_other': np.zeros(2)
-                }
+            if dist > self.comm_range:
+                continue
+            # Realistic: neighbor discovery beacons can fail under noise
+            # Use link quality to probabilistically detect neighbors
+            link_qual = compute_link_quality(dist, self.comm_range, noise_level)
+            if random.random() > link_qual:
+                continue  # Beacon lost — neighbor not detected this step
+            self.neighbors.append(other.node_id)
+            # Simplified metrics calculation
+            rel_speed = np.linalg.norm(other.velocity - self.node.velocity) if hasattr(other, 'velocity') else 0
+            self.neighbor_metrics[other.node_id] = {
+                'distance': dist,
+                'relative_speed': rel_speed,
+                'approach_rate': 0.0,
+                'link_stability': 1.0 / (1.0 + rel_speed * 0.1),
+                'contact_duration': max(10, (self.comm_range - dist) / (rel_speed + 0.1)),
+                'direction_to_other': np.zeros(2),
+                'link_quality': link_qual
+            }
         return self.neighbors
 
     def _compute_neighbor_metrics(self, other_node, dist, dt):
@@ -236,8 +252,8 @@ class Node:
             self.position += direction / dist * step
         self.velocity = (self.position - self.prev_position) / dt
 
-    def update_neighbors(self, all_nodes, current_time):
-        return self.agent_e.update_neighbors(all_nodes, current_time)
+    def update_neighbors(self, all_nodes, current_time, noise_level=0.0):
+        return self.agent_e.update_neighbors(all_nodes, current_time, noise_level=noise_level)
 
     def buffer_packet(self, packet):
         if len(self.packet_buffer) < self.max_buffer_size:
@@ -343,16 +359,18 @@ class Node:
         link_stability = temporal_features[:, 1]
         contact_duration = temporal_features[:, 2]
         low_queue = temporal_features[:, 6]
+        direction_alignment = temporal_features[:, 4]
         
         final_scores = (
             alpha * pdr_scores
             + beta * tgnn_scores
             + gamma * throughput_scores
             + delta * exploration_bonuses
-            + 4.0 * distance_progress
-            + 1.5 * link_stability
-            + 1.0 * contact_duration
-            + 0.5 * low_queue
+            + 5.0 * distance_progress       # Stronger distance-to-dst progress reward
+            + 2.0 * link_stability           # More weight on stable links
+            + 1.5 * contact_duration          # Longer contacts = better forwarding window
+            + 1.0 * low_queue                 # Prefer less congested nodes
+            + 2.0 * direction_alignment       # Prefer nodes moving toward destination
         )
         
         candidates = [(valid_neighbors[i], final_scores[i]) for i in range(n_neighbors)]
@@ -383,6 +401,47 @@ class Node:
             self.delivery_history[neighbor_id] = self.delivery_history[neighbor_id][-100:]
 
 
+# === Realistic Channel/Noise Model ===
+def compute_link_quality(distance, comm_range, noise_level):
+    """Compute link quality based on log-distance path loss + noise.
+    Returns a probability [0,1] that a frame is successfully received.
+    
+    Uses simplified SNR model:
+      - Path loss increases with distance (log-distance)
+      - Noise floor raises with noise_level
+      - Packet Error Rate derived from SNR
+    """
+    if distance <= 0:
+        return 1.0
+    if distance > comm_range:
+        return 0.0
+    # Normalized distance ratio
+    d_ratio = distance / comm_range
+    # Log-distance path loss model: signal decays as d^path_loss_exp
+    path_loss_exp = 3.5  # Typical urban/outdoor MANET environment
+    signal_strength = max(1e-12, (1.0 - d_ratio ** path_loss_exp))
+    # SNR: signal / (noise_floor + thermal)
+    noise_floor = 0.01 + noise_level * 0.5  # noise_level scales noise floor
+    snr = signal_strength / noise_floor
+    # Frame success probability from SNR (sigmoid approximation of BER curve)
+    frame_success = 1.0 / (1.0 + np.exp(-2.0 * (snr - 1.0)))
+    return float(np.clip(frame_success, 0.0, 1.0))
+
+
+def compute_packet_error_rate(distance, comm_range, noise_level, packet_size_bytes=32768):
+    """Compute Packet Error Rate based on link quality and packet size.
+    Larger packets are more likely to be corrupted.
+    PER = 1 - (1 - BER)^(packet_size_bits)
+    """
+    link_quality = compute_link_quality(distance, comm_range, noise_level)
+    # Frame error rate
+    fer = 1.0 - link_quality
+    # For larger packets, errors compound: approximate as PER = 1 - (1-fer)^(size_factor)
+    size_factor = packet_size_bytes / 1024.0  # normalized to 1KB chunks
+    per = 1.0 - (1.0 - fer) ** min(size_factor, 32)  # cap to avoid numerical issues
+    return float(np.clip(per, 0.0, 1.0))
+
+
 def update_node_positions(nodes, dt=1.0):
     for node in nodes:
         node.move(dt=dt)
@@ -402,8 +461,8 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
     # Use fixed communication range (e.g., 250 meters)
     comm_range = 250
     
-    agent_dims = {'a_in': 8, 'a_hidden': 16, 'b_in': 8, 'b_hidden': 16}  # Minimal for speed
-    fusion_weights = {'alpha': 1.5, 'beta': 2.5, 'gamma': 2.0, 'delta': 0.3}
+    agent_dims = {'a_in': 8, 'a_hidden': 32, 'b_in': 8, 'b_hidden': 32}  # Larger hidden for better capacity
+    fusion_weights = {'alpha': 1.5, 'beta': 3.0, 'gamma': 3.5, 'delta': 0.2}  # Higher TGNN+throughput, lower exploration
     
     nodes = [
         Node(i, 15, agent_dims, fusion_weights, comm_range, area_size, node_speed)
@@ -413,21 +472,20 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
     packets = []
     delivered_packets = []
     delivered_packet_ids = set()
-    PACKET_SIZE_BYTES = 8192
+    PACKET_SIZE_BYTES = 32768  # 32 KB per packet (realistic for data/video apps)
     PACKET_SIZE_BITS = PACKET_SIZE_BYTES * 8
     packet_counter = 0
-    FORWARDING_ROUNDS = 1  # Single round for speed
-    MAX_PACKETS_PER_CONTACT = 2  # Minimal for speed
+    FORWARDING_ROUNDS = 3  # More forwarding attempts per step
+    MAX_PACKETS_PER_CONTACT = 8  # More packets forwarded per encounter
     
     for t in range(num_steps):
         update_node_positions(nodes)
         for node in nodes:
-            node.update_neighbors(nodes, t)
+            node.update_neighbors(nodes, t, noise_level=noise_level)
         
-        # Generate packets proportional to node count
-        if t % 3 == 0:
-            packets_to_gen = max(5, n_nodes // 20)
-            for _ in range(packets_to_gen):
+        # Generate packets every step, proportional to node count
+        packets_to_gen = max(15, n_nodes // 5)
+        for _ in range(packets_to_gen):
                 src = random.choice(nodes)
                 dst = random.choice([n for n in nodes if n.node_id != src.node_id])
                 packet = DataPacket(src.node_id, dst.node_id, t, packet_id=packet_counter)
@@ -459,20 +517,41 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
                         packets_to_remove.append(packet)
                         continue
                     
-                    candidates = node.get_candidate_forwarders(nodes, packet, t, top_k=5)
+                    candidates = node.get_candidate_forwarders(nodes, packet, t, top_k=8)
                     if not candidates:
                         continue
                     
+                    # Realistic: limit retransmission attempts per packet per round
+                    MAX_RETRIES = 2  # Max candidates to try before giving up this round
+                    retry_count = 0
+                    forwarded_this_packet = False
+                    
                     for candidate_id, score in candidates:
+                        if retry_count >= MAX_RETRIES:
+                            # All retries exhausted — packet stays in buffer, TTL penalty
+                            packet.ttl -= 1
+                            break
+                        
                         candidate_node = nodes[candidate_id]
                         
-                        # Apply noise: random packet drop based on noise level
-                        if random.random() < noise_level:
-                            # Packet lost due to channel noise
+                        # Realistic noise: distance-dependent Packet Error Rate
+                        metrics = node.agent_e.get_metrics_for_neighbor(candidate_id)
+                        if metrics:
+                            link_dist = metrics['distance']
+                        else:
+                            link_dist = np.linalg.norm(node.position - candidate_node.position)
+                        
+                        per = compute_packet_error_rate(
+                            link_dist, comm_range, noise_level, PACKET_SIZE_BYTES
+                        )
+                        
+                        if random.random() < per:
+                            # Packet corrupted/lost on this link
+                            retry_count += 1
                             node.record_delivery_result(candidate_id, False)
                             rewards = {'a': -0.2, 'b': -0.2, 'c': -0.2, 'd': 0.1}
                             node.update_agents(rewards, candidate_id)
-                            continue  # Try next candidate
+                            continue  # Try next candidate (counts as retry)
                         
                         if candidate_id == packet.dst:
                             packet.hops.append(candidate_id)
@@ -489,6 +568,7 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
                             node.update_agents(rewards, candidate_id)
                             node.record_delivery_result(candidate_id, True)
                             forwarded_count += 1
+                            forwarded_this_packet = True
                             break
                         
                         if candidate_node.buffer_packet(packet):
@@ -506,6 +586,7 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
                             node.update_agents(rewards, candidate_id)
                             packets_to_remove.append(packet)
                             forwarded_count += 1
+                            forwarded_this_packet = True
                             break
                 
                 for pkt in packets_to_remove:
@@ -520,11 +601,15 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
     if delivered_packets:
         avg_delay = np.mean([p.delivered_time - p.created_time for p in delivered_packets])
         avg_hops = np.mean([len(p.hops) - 1 for p in delivered_packets])
+        # Throughput: delivered bits over active delivery window (seconds)
+        first_delivery = min(p.delivered_time for p in delivered_packets)
+        last_delivery = max(p.delivered_time for p in delivered_packets)
+        active_duration = max(last_delivery - first_delivery, 1)  # at least 1s
+        throughput_mbps = (total_delivered * PACKET_SIZE_BITS) / active_duration / 1e6
     else:
         avg_delay = num_steps
         avg_hops = 0
-    
-    throughput_mbps = (total_delivered * PACKET_SIZE_BITS) / num_steps / 1e6
+        throughput_mbps = 0.0
     
     return {
         'pdr': pdr,
@@ -538,10 +623,10 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
 
 def run_all_experiments():
     """Run experiments for all node counts, speeds, and noise levels."""
-    node_counts = [200]
-    speeds = [20, 25, 30, 35, 40]
-    noise_levels = [0.0, 0.1, 0.15, 0.2]
-    num_steps = 50  # Reduced for faster execution
+    node_counts = [100,200,300,400,500]
+    speeds = [20,30,40]
+    noise_levels = [0.0,0.1,0.2]
+    num_steps = 100  # More steps for accurate throughput measurement
     
     # Results storage: indexed by [node_count, speed, noise_level]
     results = {
@@ -697,7 +782,10 @@ def plot_results(results, node_counts, speeds, noise_levels):
     # =========================================================================
     # FIGURE 3: PDR & Throughput Heatmaps for each noise level
     # =========================================================================
-    fig3, axes3 = plt.subplots(2, len(noise_levels), figsize=(5 * len(noise_levels), 10))
+    n_noise = max(len(noise_levels), 2)  # Ensure at least 2 columns for 2D indexing
+    fig3, axes3 = plt.subplots(2, n_noise, figsize=(5 * n_noise, 10))
+    if len(noise_levels) == 1:
+        axes3 = axes3.reshape(2, -1)  # Ensure 2D indexing
     
     for k, noise in enumerate(noise_levels):
         # PDR Heatmap (top row)
