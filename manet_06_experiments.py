@@ -623,7 +623,7 @@ def run_single_experiment(n_nodes, node_speed, num_steps=50, noise_level=0.0):
 
 def run_all_experiments():
     """Run experiments for all node counts, speeds, and noise levels."""
-    node_counts = [300]
+    node_counts = [400]
     speeds = [20,30,40]
     noise_levels = [0.0,0.1,0.2]
     num_steps = 100  # More steps for accurate throughput measurement
