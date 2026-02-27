@@ -411,3 +411,36 @@ Noise            PDR   Delay (s)    Throughput      Hops
 0.1           0.9936       0.499       21.0474      5.14
 0.2           0.9863       0.845       20.8930      6.06
 ==========================================================================================
+
+===============================================================================
+MANET OPPORTUNISTIC ROUTING - MULTI-CONFIGURATION EXPERIMENTS
+Speeds: [20, 30, 40]                                                 ===========
+Noise levels: [0.0, 0.1, 0.2]
+Speeds: [20, 30, 40]
+Noise levels: [0.0, 0.1, 0.2]
+Speeds: [20, 30, 40]
+Noise levels: [0.0, 0.1, 0.2]
+Steps per experiment: 100
+--------------------------------------------------------------------------------
+
+[1/9] Running: Nodes=500, Speed=20 m/s, Noise=0.0
+   PDR: 0.993 | Delay: 0.537s | Throughput: 26.2991 Mbps | Hops: 5.89 | Time: 947.8s
+
+[2/9] Running: Nodes=500, Speed=20 m/s, Noise=0.1
+   PDR: 0.988 | Delay: 0.721s | Throughput: 26.1641 Mbps | Hops: 6.37 | Time: 977.1s
+ | Hops: 8.02 | Time: 1325.0s
+
+[4/9] Running: Nodes=500, Speed=30 m/s, Noise=0.0
+   PDR: 0.995 | Delay: 0.438s | Throughput: 26.3521 Mbps | Hops: 5.33 | Time: 818.0s
+
+[5/9] Running: Nodes=500, Speed=30 m/s, Noise=0.1
+   PDR: 0.992 | Delay: 0.648s | Throughput: 26.2647 Mbps | Hops: 6.07 | Time: 1229.1s
+
+[6/9] Running: Nodes=500, Speed=30 m/s, Noise=0.2
+   PDR: 0.988 | Delay: 0.937s | Throughput: 26.1614 Mbps | Hops: 6.58 | Time: 1563.5s
+
+[7/9] Running: Nodes=500, Speed=40 m/s, Noise=0.0
+   PDR: 0.995 | Delay: 0.429s | Throughput: 26.3521 Mbps | Hops: 5.24 | Time: 1111.1s
+
+[8/9] Running: Nodes=500, Speed=40 m/s, Noise=0.1
+   PDR: 0.994 | Delay: 0.577s | Throughput: 26.3256 Mbps | Hops: 5.63 | Time: 1468.6s
